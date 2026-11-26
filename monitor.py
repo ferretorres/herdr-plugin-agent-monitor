@@ -977,6 +977,34 @@ def tui(scr):
                 pass  # the pane is gone; the next refresh drops its row
 
 
+def open_workspace_args(env):
+    """`plugin pane open` argv for a monitor scoped to the action's workspace. A split needs a pane
+    to split: the focused pane when it is in that workspace, else the monitor opens as a new tab
+    of that workspace."""
+    try:
+        ctx = json.loads(env.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        ctx = {}
+    ctx = ctx if isinstance(ctx, dict) else {}
+    ws = env.get("HERDR_WORKSPACE_ID") or ctx.get("workspace_id")
+    pane = env.get("HERDR_PANE_ID") or ctx.get("focused_pane_id") or ctx.get("pane_id")
+    args = ["plugin", "pane", "open", "--plugin", "agent-monitor", "--entrypoint", "monitor"]
+    if pane and (not ws or pane.split(":")[0] == ws):  # herdr 0.9.5 rejects --workspace with --target-pane
+        args += ["--target-pane", pane, "--direction", "right"]
+    elif ws:
+        args += ["--workspace", ws, "--placement", "tab"]
+    return args + ["--env", "AGENT_MONITOR_SCOPE=workspace"]
+
+
+def open_workspace():
+    try:
+        print(herdr(*open_workspace_args(os.environ)), end="")
+        return 0
+    except (HerdrError, subprocess.TimeoutExpired) as e:
+        print(f"agent-monitor: {e}", file=sys.stderr)
+        return 1
+
+
 def once(argv):
     """Print one plain frame; exit code 1 with a warning when herdr fails or hangs."""
     width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
@@ -997,6 +1025,8 @@ def once(argv):
 
 
 if __name__ == "__main__":
+    if "--open-workspace" in sys.argv:  # the "Agent monitor (this workspace)" action
+        sys.exit(open_workspace())
     if "--once" in sys.argv:
         sys.exit(once(sys.argv))
     else:

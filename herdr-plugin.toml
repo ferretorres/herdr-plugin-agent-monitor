@@ -1,8 +1,9 @@
 id = "agent-monitor"
 name = "agent-monitor"
-version = "0.1.0"
-description = "What every agent on this herdr server is doing and using: goal, last prompt, current action, context, tokens, cost"
-min_herdr_version = "0.9.1"
+version = "0.2.0"
+description = "What the agents on this herdr server are doing and using: goal, last prompt, current action, context, tokens, cost"
+min_herdr_version = "0.9.5"
+platforms = ["linux", "macos"]
 
 [[panes]]
 id = "monitor"
@@ -13,7 +14,15 @@ placement = "split"
 [[actions]]
 id = "open"
 title = "Agent monitor"
-description = "What every agent on this herdr server is doing and using: goal, last prompt, current action, context, tokens, cost"
-min_herdr_version = "0.9.1"
-command = ["herdr", "plugin", "pane", "open", "--plugin", "agent-monitor", "--entrypoint", "monitor"]
+description = "Every agent on this herdr server"
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin agent-monitor --entrypoint monitor"]
 contexts = ["global"]
+
+# Opens a split next to the focused pane of the action's workspace, scoped with
+# AGENT_MONITOR_SCOPE=workspace (see open_workspace_args in monitor.py).
+[[actions]]
+id = "open-workspace"
+title = "Agent monitor (this workspace)"
+description = "Only the agents in this workspace, leads first with their workers"
+command = ["python3", "monitor.py", "--open-workspace"]
+contexts = ["workspace"]

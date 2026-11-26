@@ -365,6 +365,17 @@ for h in range(1, 9):
 monitor.init_colors, monitor.refresh_forever, curses.curs_set = saved_fns[:3]
 print("ok")
 
+# --- "Agent monitor (this workspace)" action --------------------------------------------------------
+ctx = json.dumps({"workspace_id": "w1", "focused_pane_id": "w1:p4"})
+args = monitor.open_workspace_args({"HERDR_WORKSPACE_ID": "w1", "HERDR_PLUGIN_CONTEXT_JSON": ctx})
+assert args[-2:] == ["--env", "AGENT_MONITOR_SCOPE=workspace"]
+assert "--workspace" not in args and args[7:11] == ["--target-pane", "w1:p4", "--direction", "right"], args
+other = json.dumps({"workspace_id": "w2", "focused_pane_id": "w1:p4"})            # focus is elsewhere
+args = monitor.open_workspace_args({"HERDR_PLUGIN_CONTEXT_JSON": other})
+assert args[7:11] == ["--workspace", "w2", "--placement", "tab"], args
+assert monitor.open_workspace_args({"HERDR_PLUGIN_CONTEXT_JSON": "nope"})[7:] == ["--env", "AGENT_MONITOR_SCOPE=workspace"]
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"
