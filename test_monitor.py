@@ -38,15 +38,7 @@ assert cost({"in": 1e6, "cr": 0, "cw": 0, "out": 1e6}, price_for("claude-opus-5-
 assert price_for("gpt-x", PRICES) is None
 print("ok")
 
-# Workspace colours follow herdr-plugin-space-colors: FNV-1a 64 test vector, rules before the hash.
-from monitor import SPACE_ACCENTS, choose_palette, fnv1a, nearest_256
-assert fnv1a("") == 0xcbf29ce484222325 and fnv1a("a") == 0xaf63dc4c8601ec8c
-names = sorted(SPACE_ACCENTS)
-assert choose_palette("x", "/a/b", SPACE_ACCENTS, [], True) == names[fnv1a("/a/b") % 8]
-rules = [{"path": "/a", "palette": "red"}, {"path": "/a/b", "palette": "teal"}, {"label": "L", "palette": "pink"}]
-assert choose_palette("x", "/a/b/c", SPACE_ACCENTS, rules, True) == "teal"     # longest path wins
-assert choose_palette("L", "/a/b/c", SPACE_ACCENTS, rules, True) == "pink"     # label beats path
-assert choose_palette("x", "/zzz", SPACE_ACCENTS, rules, False) is None        # auto off, no rule
+from monitor import nearest_256
 assert nearest_256("#ff0000") == 196 and nearest_256("#000000") == 16
 print("ok")
 
@@ -131,8 +123,7 @@ assert sum(1 for c in calls if c != ("agent", "read")) == 1, calls          # on
 monitor.herdr = real
 assert rows["w1:p1"]["space"] == "teal"     # the agent's own token
 assert rows["w1:p2"]["space"] == "pink"     # else the pane's token
-# no token anywhere: space-colors' hash of the first non-empty pane cwd in that workspace
-assert rows["w2:p1"]["space"] == names[fnv1a("/b/c") % 8], rows["w2:p1"]["space"]
+assert rows["w2:p1"]["space"] is None      # no token anywhere: no colour
 assert monitor.sc_palette({"x": "1"}, {"sc_my-own": "●"}) == "my-own" and monitor.sc_palette({}) is None
 print("ok")
 
@@ -298,7 +289,7 @@ assert os.listdir(os.path.join(sd, "plugin")) == ["columns.json"]          # no 
 assert monitor.load_cols()["activity"][3][1] == 9
 os.environ.pop("HERDR_PLUGIN_STATE_DIR")
 os.environ["XDG_STATE_HOME"] = os.path.join(sd, "xdg")
-assert monitor.state_dir() == os.path.join(sd, "xdg", "herdr", "plugins", "agent-monitor")
+assert monitor.state_dir() == os.path.join(sd, "xdg", "herdr", "plugins", "ferretorres.agent-monitor")
 open(os.path.join(sd, "blocker"), "w").close()
 os.environ["XDG_STATE_HOME"] = os.path.join(sd, "blocker")                  # a file, not a dir
 assert monitor.save_cols(cols) is False                                    # reported, not raised
@@ -397,4 +388,16 @@ err = io.StringIO()
 with contextlib.redirect_stderr(err):
     assert monitor.once(["--once"]) == 1
 assert "did not answer" in err.getvalue()
+print("ok")
+
+# prices.json in the plugin config folder adds models and overrides the built-in prices.
+cfg = tempfile.mkdtemp()
+with open(os.path.join(cfg, "prices.json"), "w") as f:
+    json.dump({"my-gateway-model": {"in": 1, "out": 2, "cache_read": 0, "cache_write": 0}}, f)
+os.environ["HERDR_PLUGIN_CONFIG_DIR"] = cfg
+assert monitor.price_for("my-gateway-model-v2", monitor.load_prices())["out"] == 2
+del os.environ["HERDR_PLUGIN_CONFIG_DIR"]
+os.environ["XDG_CONFIG_HOME"] = os.path.join(cfg, "xdg")
+assert monitor.config_dir() == os.path.join(cfg, "xdg", "herdr", "plugins", "config", "ferretorres.agent-monitor")
+del os.environ["XDG_CONFIG_HOME"]
 print("ok")

@@ -14,14 +14,15 @@ Mouse: click a row for full details (click again to close), drag a header │ to
        wheel to scroll. Keys: ↑↓ select · ⏎ jump to pane · v view · d details · esc close ·
        ←→ pick column · +/- width · 0 fill · space hide/show · q quit.
 Column widths persist in columns.json under the plugin state dir; prices (USD per 1M tokens) in
-prices.json next to this file. PANE is coloured with the sc_<palette> token of
-ferretorres/herdr-plugin-space-colors, or that plugin's hash when no token exists.
+prices.json in the plugin config folder (see config_dir) or next to this file. PANE is coloured with the sc_<palette> token of
+ferretorres/herdr-plugin-space-colors when that plugin is installed.
 Run `monitor.py --once [--usage]` for a single plain-text frame.
 """
 import curses, glob, json, os, re, subprocess, sys, textwrap, threading, time
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_ID = "ferretorres.agent-monitor"
 GLYPH = {"working": "●", "blocked": "▲", "idle": "○", "done": "✓", "unknown": "◌"}
 ORDER = {"blocked": 0, "working": 1, "idle": 2, "done": 3, "unknown": 4}
 # per view: [name, width]; width 0 = share the rest, -1 = hidden
@@ -399,12 +400,24 @@ def screen_prune(panes):
             del _screen[pane]
 
 
+def config_dir():
+    """HERDR_PLUGIN_CONFIG_DIR in a plugin pane, else herdr's plugin config folder for this plugin.
+    It survives `herdr plugin update`, which replaces the folder this file is in."""
+    if os.environ.get("HERDR_PLUGIN_CONFIG_DIR"):
+        return os.environ["HERDR_PLUGIN_CONFIG_DIR"]
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    return os.path.join(base, "herdr", "plugins", "config", PLUGIN_ID)
+
+
 def load_prices():
+    """Built-in prices, then prices.json next to this file, then prices.json in the config folder."""
     prices = dict(PRICES)
-    try:
-        prices.update(json.load(open(os.path.join(HERE, "prices.json"))))
-    except (OSError, ValueError):
-        pass
+    for folder in (HERE, config_dir()):
+        try:
+            with open(os.path.join(folder, "prices.json")) as f:
+                prices.update(json.load(f))
+        except (OSError, ValueError):
+            pass
     return prices
 
 
@@ -432,58 +445,24 @@ def ago(ts):
     return f"{s}s" if s < 60 else f"{s // 60}m" if s < 3600 else f"{s // 3600}h" if s < 86400 else f"{s // 86400}d"
 
 
-# Workspace colours, the same as ferretorres/herdr-plugin-space-colors (v0.3.3, main.rs choose_palette):
-# its config rules first, else FNV-1a of the workspace's first pane cwd onto the palettes sorted by name.
-# Without that plugin's config, its default palettes and auto hash apply, so colours match once installed.
+# Workspace colours come from ferretorres/herdr-plugin-space-colors, which puts an sc_<palette>
+# token on each agent, pane and workspace. Its config names the accent of each palette; without
+# that config (or on Python < 3.11, which has no tomllib) its default accents apply.
 SPACE_CONFIG = f"{HOME}/.config/herdr/plugins/config/ferretorres.space-colors/config.toml"
 SPACE_ACCENTS = {"blue": "#89b4fa", "green": "#a6e3a1", "mauve": "#cba6f7", "peach": "#fab387",
                  "pink": "#f5c2e7", "red": "#f38ba8", "teal": "#94e2d5", "yellow": "#f9e2af"}
 
 
 def load_space_colors():
-    """(accent hex by palette name, workspace rules, auto) from the space-colors config, else defaults."""
+    """Accent hex by palette name, from the space-colors config, else its defaults."""
     try:
         import tomllib  # Python 3.11+
         with open(SPACE_CONFIG, "rb") as f:
             cfg = tomllib.load(f)
     except (ImportError, OSError, ValueError):
-        return dict(SPACE_ACCENTS), [], True
+        return dict(SPACE_ACCENTS)
     accents = {name: p["accent"] for name, p in cfg.get("palettes", {}).items() if p.get("accent")}
-    return accents or dict(SPACE_ACCENTS), cfg.get("workspaces", []), cfg.get("auto", True)
-
-
-def fnv1a(text):
-    h = 0xcbf29ce484222325
-    for b in text.encode():
-        h = ((h ^ b) * 0x100000001b3) % 2**64
-    return h
-
-
-def choose_palette(label, cwd, accents, rules, auto):
-    best, score = None, -1
-    for r in rules:
-        if r.get("palette") not in accents:
-            continue
-        if r.get("label") and r["label"] == label:
-            return r["palette"]
-        path = os.path.expanduser(r.get("path", "")).rstrip("/")
-        if path and (cwd == path or cwd.startswith(path + "/")) and len(path) > score:
-            best, score = r["palette"], len(path)
-    if best or not auto:
-        return best
-    names = sorted(accents)
-    return names[fnv1a(cwd or label) % len(names)]
-    # ponytail: the plugin's per-pane [[agents]] overrides are not applied; add if someone uses them
-
-
-def workspace_palettes(panes, spaces, accents, rules, auto):
-    """Fallback when space-colors is not installed: its hash, from the first non-empty pane cwd."""
-    first_cwd = {}
-    for p in panes:
-        if p.get("cwd"):
-            first_cwd.setdefault(p.get("workspace_id"), p["cwd"])
-    return {w["workspace_id"]: choose_palette(w.get("label", ""), first_cwd.get(w["workspace_id"], ""),
-                                              accents, rules, auto) for w in spaces}
+    return accents or dict(SPACE_ACCENTS)
 
 
 def sc_palette(*token_maps):
@@ -561,7 +540,6 @@ def build_rows(snap, ws=None, wait=False):
     screen_prune(screens)
     panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
     spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
-    hashed = None  # space-colors' own choice is on every pane as a token; hash only without it
     prices = load_prices()
     rows = []
     for a in agents:
@@ -584,10 +562,6 @@ def build_rows(snap, ws=None, wait=False):
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
         palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"),
                              (spaces.get(a.get("workspace_id")) or {}).get("tokens"))
-        if not palette:
-            if hashed is None:
-                hashed = workspace_palettes(panes.values(), spaces.values(), *load_space_colors())
-            palette = hashed.get(a.get("workspace_id"))
         rows.append({
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
             "space": palette, "parent": lead if role == "worker" else None,
@@ -697,12 +671,12 @@ def frame(rows, cols, width):
 
 
 def state_dir():
-    """HERDR_PLUGIN_STATE_DIR in a plugin pane, else ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/agent-monitor.
+    """HERDR_PLUGIN_STATE_DIR in a plugin pane, else ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/ferretorres.agent-monitor.
     Not the plugin dir: an installed plugin's dir is replaced on update."""
     if os.environ.get("HERDR_PLUGIN_STATE_DIR"):
         return os.environ["HERDR_PLUGIN_STATE_DIR"]
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
-    return os.path.join(base, "herdr", "plugins", "agent-monitor")
+    return os.path.join(base, "herdr", "plugins", PLUGIN_ID)
 
 
 def load_cols():
@@ -784,7 +758,7 @@ def space_pairs(big):
     if not big:
         return {}
     pairs = {}
-    for n, (name, accent) in enumerate(sorted(load_space_colors()[0].items()), 20):
+    for n, (name, accent) in enumerate(sorted(load_space_colors().items()), 20):
         curses.init_pair(n, nearest_256(accent), -1)
         pairs[name] = curses.color_pair(n) | curses.A_BOLD
     return pairs
@@ -992,7 +966,7 @@ def open_workspace_args(env):
     ctx = ctx if isinstance(ctx, dict) else {}
     ws = env.get("HERDR_WORKSPACE_ID") or ctx.get("workspace_id")
     pane = env.get("HERDR_PANE_ID") or ctx.get("focused_pane_id") or ctx.get("pane_id")
-    args = ["plugin", "pane", "open", "--plugin", "agent-monitor", "--entrypoint", "monitor"]
+    args = ["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "monitor"]
     if pane and (not ws or pane.split(":")[0] == ws):  # herdr 0.9.5 rejects --workspace with --target-pane
         args += ["--target-pane", pane, "--direction", "right"]
     elif ws:

@@ -1,6 +1,6 @@
-id = "agent-monitor"
+id = "ferretorres.agent-monitor"
 name = "agent-monitor"
-version = "0.2.0"
+version = "0.3.0"
 description = "What the agents on this herdr server are doing and using: goal, last prompt, current action, context, tokens, cost"
 min_herdr_version = "0.9.5"
 platforms = ["linux", "macos"]
@@ -15,7 +15,7 @@ placement = "split"
 id = "open"
 title = "Agent monitor"
 description = "Every agent on this herdr server"
-command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin agent-monitor --entrypoint monitor"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ferretorres.agent-monitor --entrypoint monitor"]
 contexts = ["global"]
 
 # Opens a split next to the focused pane of the action's workspace, scoped with
