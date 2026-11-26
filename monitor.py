@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Agent monitor for herdr: what every agent on this herdr server is doing, and what it costs.
+"""Agent monitor for herdr: what the agents on this herdr server are doing, and what they cost.
 
-Data: `herdr agent list` (all agents, all workspaces) + per agent:
-  claude -> transcript (~/.claude/projects/*/<session>.jsonl, plus its subagents/)
-  codex  -> newest rollout in ~/.codex/sessions with the same cwd
-  other  -> last lines of the pane's screen (`herdr agent read`); no token data
+Data: one `herdr api snapshot` per refresh (agents, panes, workspaces) + per agent:
+  claude -> transcript (agent_session path, or <id>.jsonl under $CLAUDE_CONFIG_DIR/projects and
+            ~/.claude*/projects), plus its subagents/
+  codex  -> rollout in $CODEX_HOME/sessions by session id, else the newest one with the same cwd
+  other  -> last lines of the pane's screen (`herdr agent read`, in the background); no token data
+Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspace) | <workspace id>.
+Crew tokens on panes order the rows: a lead (crew_role=lead), then its workers (crew_lead=<lead pane>).
 
 Views (v to switch): activity (goal, last prompt, current action) and usage (context, tokens, cost).
 Mouse: click a row for full details (click again to close), drag a header │ to resize,
        wheel to scroll. Keys: ↑↓ select · ⏎ jump to pane · v view · d details · esc close ·
        ←→ pick column · +/- width · 0 fill · space hide/show · q quit.
-Column widths persist in columns.json under the plugin state dir; prices (USD per 1M tokens) in prices.json next to this file.
-PANE is coloured per workspace like ferretorres/herdr-plugin-space-colors (its config if present).
+Column widths persist in columns.json under the plugin state dir; prices (USD per 1M tokens) in
+prices.json next to this file. PANE is coloured with the sc_<palette> token of
+ferretorres/herdr-plugin-space-colors, or that plugin's hash when no token exists.
 Run `monitor.py --once [--usage]` for a single plain-text frame.
 """
 import curses, glob, json, os, re, subprocess, sys, textwrap, threading, time
