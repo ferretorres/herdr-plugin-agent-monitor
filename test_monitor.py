@@ -601,3 +601,35 @@ monitor.load_reads(cache)
 assert monitor._new[t][1] > 0 and monitor.claude_file_usage(t)[0][0] == 7
 del os.environ["HERDR_PLUGIN_STATE_DIR"]
 print("ok")
+
+# --- second-round fixes ----------------------------------------------------------------------------
+# last-prompt records never replace the real latest user line.
+t = jsonl([{"type": "user", "message": {"content": "newest real prompt"}},
+           {"type": "last-prompt", "lastPrompt": "an older, cut prompt"}])
+monitor._cu.clear()
+assert monitor.claude_usage(t)["prompt"] == "newest real prompt"
+# Odd values are dropped before they reach the running state.
+t = jsonl([{"type": "assistant", "message": {"id": "m1", "model": 7, "usage": {"input_tokens": "12"}}}])
+monitor._cu.clear()
+u = monitor.claude_usage(t)
+assert u["model"] == "" and u["in"] == 0
+t = jsonl([{"type": "event_msg", "payload": {"type": "token_count", "info": {
+    "total_token_usage": {"input_tokens": "12"}, "last_token_usage": "x", "model_context_window": "9"}}}])
+monitor._xu.clear()
+assert monitor.codex_usage(t)["in"] == 0 and monitor.codex_usage(t)["window"] is None
+assert monitor.claude_activity(jsonl([{"type": "user", "message": "x"},
+                                      {"type": "assistant", "message": {"content": ["y"]}}]))[:2] == ("", "")
+# A prices.json entry with no usable number leaves the built-in price alone.
+cfg = tempfile.mkdtemp()
+with open(os.path.join(cfg, "prices.json"), "w") as f:
+    f.write('{"claude-opus-5-5": {"in": "4.0"}}')
+os.environ["HERDR_PLUGIN_CONFIG_DIR"] = cfg
+assert monitor.price_for("claude-opus-5-5", monitor.load_prices())["in"] == 4.0
+del os.environ["HERDR_PLUGIN_CONFIG_DIR"]
+# A reader that fails costs only its own row.
+real_read = monitor.read_agent
+monitor.read_agent = lambda *a: (_ for _ in ()).throw(TypeError("boom"))
+rows = monitor.build_rows({"agents": [{"pane_id": "w1:p1", "agent": "zzz", "agent_status": "idle"}]}, screens=False)
+assert rows[0]["cells"]["NOW"].startswith("monitor: could not read") and rows[0]["usage"] is None
+monitor.read_agent = real_read
+print("ok")

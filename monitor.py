@@ -224,16 +224,18 @@ def claude_activity(path):
 def _claude_activity(path):
     prompt = now = ""
     for o in tail_lines(path):
-        msg = o.get("message") or {}
+        msg = _obj(o.get("message"))
         content = msg.get("content")
         if o.get("type") == "user":
             texts = [content] if isinstance(content, str) else [
-                c.get("text", "") for c in content or [] if c.get("type") == "text"]
-            texts = [t for t in texts if is_human(t)]
+                c.get("text", "") for c in content or [] if isinstance(c, dict) and c.get("type") == "text"]
+            texts = [t for t in texts if isinstance(t, str) and is_human(t)]
             if texts:
                 prompt = texts[-1]
         elif o.get("type") == "assistant" and isinstance(content, list):
             for c in content:
+                if not isinstance(c, dict):
+                    continue
                 if c.get("type") == "tool_use":
                     now = describe_tool(c.get("name", "tool"), c.get("input"))
                 elif c.get("type") == "text" and c.get("text", "").strip():
@@ -254,8 +256,8 @@ def claude_file_usage(path):
         st = _cu[path] = fresh()
     for o in objs:
         msg = _obj(o.get("message"))
-        if o.get("type") == "user" or o.get("type") == "last-prompt":
-            text = o.get("lastPrompt") if o.get("type") == "last-prompt" else msg.get("content")
+        if o.get("type") == "user":
+            text = msg.get("content")
             texts = [text] if isinstance(text, str) else [
                 c.get("text", "") for c in text or [] if isinstance(c, dict) and c.get("type") == "text"]
             texts = [t for t in texts if isinstance(t, str) and is_human(t)]
@@ -270,12 +272,16 @@ def claude_file_usage(path):
             st["id"] = msg.get("id")
         st["cur"] = claude_reply_usage(u)
         st["ctx"] = sum(st["cur"][:4])
-        st["model"] = msg.get("model") or st["model"]
+        st["model"] = _s(msg.get("model")) or st["model"]
     return [a + b for a, b in zip(st["tot"], st["cur"])], st["ctx"], st["model"]
 
 
 def _obj(v):
     return v if isinstance(v, dict) else {}
+
+
+def _s(v):
+    return v if isinstance(v, str) else ""
 
 
 def claude_reply_usage(u):
@@ -290,9 +296,10 @@ def claude_reply_usage(u):
     for p in parts:
         cc = p.get("cache_creation") or {}
         w1h = cc.get("ephemeral_1h_input_tokens") or 0
-        w5m = cc.get("ephemeral_5m_input_tokens", (p.get("cache_creation_input_tokens") or 0) - w1h) or 0
-        vals = [p.get("input_tokens") or 0, p.get("cache_read_input_tokens") or 0, max(0, w5m), w1h,
-                p.get("output_tokens") or 0]
+        w5m = cc.get("ephemeral_5m_input_tokens", _n(p.get("cache_creation_input_tokens")) - _n(w1h)) or 0
+        w1h, w5m = _n(w1h), _n(w5m)
+        vals = [_n(p.get("input_tokens")), _n(p.get("cache_read_input_tokens")), max(0, w5m), w1h,
+                _n(p.get("output_tokens"))]
         out = [a + b for a, b in zip(out, vals)]
     return out
 
@@ -355,12 +362,12 @@ def codex_activity(path):
 def _codex_activity(path):
     prompt = now = ""
     for o in tail_lines(path):
-        p = o.get("payload") or {}
+        p = _obj(o.get("payload"))
         kind = p.get("type")
         if o.get("type") != "response_item":
             continue
         if kind == "message":
-            text = " ".join(c.get("text", "") for c in p.get("content") or [])
+            text = " ".join(_s(c.get("text")) for c in p.get("content") or [] if isinstance(c, dict))
             if p.get("role") == "user" and is_human(text):
                 prompt = text
             elif p.get("role") == "assistant" and text.strip():
@@ -388,14 +395,14 @@ def codex_usage(path):
         if p.get("type") == "token_count" and isinstance(p.get("info"), dict):
             st["info"] = p["info"]
         elif o.get("type") == "turn_context":
-            st["model"] = p.get("model") or st["model"]
+            st["model"] = _s(p.get("model")) or st["model"]
     info = st["info"] or {}
-    t, last = info.get("total_token_usage") or {}, info.get("last_token_usage") or {}
-    cached, cw = t.get("cached_input_tokens", 0), t.get("cache_write_input_tokens", 0)
-    return {"in": max(0, t.get("input_tokens", 0) - cached - cw),  # codex input includes cached
-            "cr": cached, "cw": cw, "cw5m": cw, "cw1h": 0, "out": t.get("output_tokens", 0),
-            "ctx": last.get("input_tokens", 0), "model": st["model"],
-            "window": info.get("model_context_window"), "subagents": 0}
+    t, last = _obj(info.get("total_token_usage")), _obj(info.get("last_token_usage"))
+    cached, cw = _n(t.get("cached_input_tokens")), _n(t.get("cache_write_input_tokens"))
+    return {"in": max(0, _n(t.get("input_tokens")) - cached - cw),  # codex input includes cached
+            "cr": cached, "cw": cw, "cw5m": cw, "cw1h": 0, "out": _n(t.get("output_tokens")),
+            "ctx": _n(last.get("input_tokens")), "model": st["model"],
+            "window": _n(info.get("model_context_window")) or None, "subagents": 0}
 
 
 def pi_dir():
@@ -494,12 +501,12 @@ def pi_usage(path):
         usd = u["cost"].get("total") if isinstance(u.get("cost"), dict) else 0
         st["usd"] += usd if isinstance(usd, (int, float)) else 0
         if kind == "message" and m.get("role") == "assistant" and m.get("stopReason") not in ("aborted", "error"):
-            ctx = u.get("totalTokens") or sum(vals)
+            ctx = _n(u.get("totalTokens")) or sum(vals)
             if ctx:
-                st["ctx"], st["model"], st["provider"] = ctx, m.get("model") or st["model"], m.get("provider") or ""
+                st["ctx"], st["model"], st["provider"] = ctx, _s(m.get("model")) or st["model"], _s(m.get("provider"))
     t = st["tot"]
     return {"in": t[0], "cr": t[1], "cw": t[2], "out": t[3], "ctx": st["ctx"] or 0, "model": st["model"],
-            "window": pi_window(st["provider"], st["model"]), "subagents": 0,
+            "window": _n(pi_window(st["provider"], st["model"])) or None, "subagents": 0,
             "usd": st["usd"] or None, "usd_src": "pi" if st["usd"] else None}
 
 
@@ -604,7 +611,7 @@ def opencode_read(a):
             now = "says: " + p["text"]
     text = prompt[0] if prompt and is_human(prompt[0]) else ""
     usage = {"in": tin or 0, "cr": tcr or 0, "cw": tcw or 0, "out": tout or 0, "ctx": ctx, "model": model,
-             "window": opencode_window(provider, model), "subagents": n or 0,
+             "window": _n(opencode_window(provider, model)) or None, "subagents": n or 0,
              "usd": usd or None, "usd_src": "opencode" if usd else None}
     return text, now, (head[0] or 0) / 1000 or None, usage
 
@@ -689,7 +696,8 @@ def load_prices():
             if not isinstance(key, str) or not isinstance(entry, dict):
                 continue  # a malformed entry is skipped, never a crash for every row
             nums = {f: v for f, v in entry.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            prices[key] = dict(prices.get(key, {}), **nums)  # keys left out keep their built-in values
+            if nums:
+                prices[key] = dict(prices.get(key, {}), **nums)  # keys left out keep their built-in values
     return prices
 
 
@@ -831,21 +839,11 @@ def build_rows(snap, ws=None, wait=False, screens=True):
     prices = load_prices()
     rows = []
     for a in agents:
-        path, usage = found[a["pane_id"]], None
-        if path and a["agent"] == "claude":
-            prompt, now, ts = claude_activity(path)
-            usage = claude_usage(path)
-            prompt = prompt or usage.get("prompt", "")  # big attachments can push it out of the tail
-        elif path and a["agent"] == "pi":
-            prompt, now, ts = pi_activity(path)
-            usage = pi_usage(path)
-        elif path:
-            prompt, now, ts = codex_activity(path)
-            usage = codex_usage(path)
-        elif oc.get(a["pane_id"]):
-            prompt, now, ts, usage = oc[a["pane_id"]]
-        else:
-            prompt, now, ts = screens[a["pane_id"]]["value"]
+        path = found[a["pane_id"]]
+        try:
+            prompt, now, ts, usage = read_agent(a, path, oc.get(a["pane_id"]), screens.get(a["pane_id"]))
+        except Exception as e:  # one odd session file costs its own row's data, never the whole table
+            prompt, now, ts, usage = "", f"monitor: could not read its session ({type(e).__name__})", None, None
         price = price_for(usage and usage["model"], prices)
         window = (usage or {}).get("window") or (price or {}).get("ctx")
         # Agents that record their own cost (pi, opencode) use it; the rest are list-priced here.
@@ -884,6 +882,21 @@ def build_rows(snap, ws=None, wait=False, screens=True):
     prune_caches()
     rows.sort(key=lambda r: (ORDER.get(r["status"], len(ORDER)), pane_key(r["pane"])))
     return tree_order(rows)
+
+
+def read_agent(a, path, oc, screen):
+    """(prompt, now, ts, usage) from the agent's own session data, else its screen."""
+    if path and a["agent"] == "claude":
+        prompt, now, ts = claude_activity(path)
+        usage = claude_usage(path)
+        return prompt or usage.get("prompt", ""), now, ts, usage  # attachments can push it out of the tail
+    if path and a["agent"] == "pi":
+        return (*pi_activity(path), pi_usage(path))
+    if path:
+        return (*codex_activity(path), codex_usage(path))
+    if oc:
+        return oc
+    return (*screen["value"], None)
 
 
 def pane_key(pane_id):
