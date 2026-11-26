@@ -198,6 +198,37 @@ assert dict(monitor.fit_cols(monitor.VIEWS["activity"], rows))["PANE"] == len(" 
 assert "  └ w1:p5 " in "\n".join(monitor.frame(rows, monitor.VIEWS["activity"], 200))
 print("ok")
 
+# --- transcript lookup, sort, glyphs --------------------------------------------------------------
+home = tempfile.mkdtemp()
+for d in (".claude/projects/a", ".claude-alt/projects/b", "elsewhere/projects/c", ".codex/sessions/2026/11/26"):
+    os.makedirs(os.path.join(home, d))
+for f in (".claude-alt/projects/b/S1.jsonl", "elsewhere/projects/c/S2.jsonl",
+          ".codex/sessions/2026/11/26/rollout-2026-11-26T10-00-00-XID.jsonl"):
+    open(os.path.join(home, f), "w").write('{"payload": {"cwd": "/w"}}\n')
+monitor.HOME, real_home = home, monitor.HOME
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+os.environ["CODEX_HOME"] = os.path.join(home, ".codex")
+assert monitor.claude_path("id", "S1") == os.path.join(home, ".claude-alt/projects/b/S1.jsonl")   # ~/.claude*
+assert monitor.claude_path("id", "S2") is None
+os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(home, "elsewhere")
+assert monitor.claude_path("id", "S2") == os.path.join(home, "elsewhere/projects/c/S2.jsonl")      # CLAUDE_CONFIG_DIR
+os.environ.pop("CLAUDE_CONFIG_DIR")
+direct = os.path.join(home, "elsewhere/projects/c/S2.jsonl")
+assert monitor.claude_path("path", direct) == direct and monitor.claude_path("path", direct + "x") is None
+rollout = os.path.join(home, ".codex/sessions/2026/11/26/rollout-2026-11-26T10-00-00-XID.jsonl")
+assert monitor.codex_path("/nope", "id", "XID") == rollout          # by session id
+assert monitor.codex_path("/w") == rollout                          # by cwd
+assert monitor.codex_path("/w", "path", rollout) == rollout
+monitor.HOME = real_home
+os.environ.pop("CODEX_HOME")
+
+ids = ["w10:p1", "w2:p10", "w2:p9", "w1:p1"]
+assert sorted(ids, key=monitor.pane_key) == ["w1:p1", "w2:p9", "w2:p10", "w10:p1"]
+rows = monitor.build_rows({"agents": [agent("w10:p1"), agent("w2:p1"), agent("w1:p1", status="unknown")]})
+assert [r["pane"] for r in rows] == ["w2:p1", "w10:p1", "w1:p1"]    # unknown sorts last
+assert rows[-1]["cells"]["ST"] == "◌"
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"

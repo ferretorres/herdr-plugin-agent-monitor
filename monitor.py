@@ -18,7 +18,8 @@ import curses, glob, json, os, re, subprocess, sys, textwrap, threading, time
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
-GLYPH = {"working": "●", "blocked": "▲", "idle": "○", "done": "✓"}
+GLYPH = {"working": "●", "blocked": "▲", "idle": "○", "done": "✓", "unknown": "◌"}
+ORDER = {"blocked": 0, "working": 1, "idle": 2, "done": 3, "unknown": 4}
 # per view: [name, width]; width 0 = share the rest, -1 = hidden
 VIEWS = {
     "activity": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["AGE", 5], ["GOAL", 34], ["LAST PROMPT", 40], ["NOW", 0]],
@@ -129,9 +130,34 @@ def describe_tool(name, inp):
     return name
 
 
-def claude_path(session_id):
-    paths = glob.glob(f"{HOME}/.claude/projects/*/{session_id}.jsonl")
-    return paths[0] if paths else None
+def claude_roots():
+    """Transcript roots: $CLAUDE_CONFIG_DIR/projects, then every ~/.claude*/projects
+    (agents started with another CLAUDE_CONFIG_DIR, e.g. ~/.claude-alt, write there)."""
+    roots = []
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        roots.append(os.path.join(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"]), "projects"))
+    roots += sorted(glob.glob(os.path.join(glob.escape(HOME), ".claude*", "projects")))
+    return [r for r in dict.fromkeys(roots) if os.path.isdir(r)]
+
+
+def session_file(kind, value):
+    """agent_session of kind "path" names the transcript itself."""
+    if kind == "path" and value:
+        path = os.path.expanduser(value)
+        return path if os.path.isfile(path) else None
+    return None
+
+
+def claude_path(kind, value):
+    if not value:
+        return None
+    if kind == "path":
+        return session_file(kind, value)
+    for root in claude_roots():
+        paths = glob.glob(os.path.join(glob.escape(root), "*", glob.escape(value) + ".jsonl"))
+        if paths:
+            return paths[0]
+    return None
 
 
 def claude_activity(path):
@@ -188,21 +214,41 @@ def claude_usage(path):
 _codex_cwd = {}  # rollout path -> cwd (session_meta is the first line, never changes)
 
 
-def codex_path(cwd):
-    # ponytail: herdr's codex hook sends no session id, so match by cwd + newest file;
+def codex_root():
+    return os.path.join(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"), "sessions")
+
+
+def codex_path(cwd, kind=None, value=None):
+    """The agent's rollout: by session path or id when herdr has one, else the newest rollout
+    of the last 3 days with the same cwd."""
+    if kind == "path":
+        return session_file(kind, value)
+    pattern = os.path.join(glob.escape(codex_root()), "*", "*", "*", "rollout-*.jsonl")
+    if value:
+        hit = glob.glob(pattern[:-len(".jsonl")] + glob.escape(value) + ".jsonl")
+        if hit:
+            return hit[0]
+    # ponytail: without a session id, match by cwd + newest file;
     # two codex agents in one directory would show the same session.
-    best = None
-    for p in glob.glob(f"{HOME}/.codex/sessions/*/*/*/rollout-*.jsonl"):
-        if time.time() - os.path.getmtime(p) > 3 * 86400:
+    best, best_mtime, now, seen = None, 0, time.time(), {}
+    for p in glob.glob(pattern):
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            continue
+        if now - mtime > 3 * 86400:
             continue
         if p not in _codex_cwd:
-            with open(p) as f:
-                try:
+            try:
+                with open(p) as f:
                     _codex_cwd[p] = json.loads(f.readline()).get("payload", {}).get("cwd")
-                except ValueError:
-                    _codex_cwd[p] = None
-        if _codex_cwd[p] == cwd and (best is None or os.path.getmtime(p) > os.path.getmtime(best)):
-            best = p
+            except (OSError, ValueError, AttributeError):
+                _codex_cwd[p] = None
+        seen[p] = _codex_cwd[p]
+        if seen[p] == cwd and mtime > best_mtime:
+            best, best_mtime = p, mtime
+    _codex_cwd.clear()  # forget rollouts that aged out or were deleted
+    _codex_cwd.update(seen)
     return best
 
 
@@ -401,12 +447,12 @@ def build_rows(snap, ws=None):
     prices = load_prices()
     rows = []
     for a in agents:
-        sess = (a.get("agent_session") or {}).get("value")
+        kind, sess = (a.get("agent_session") or {}).get("kind"), (a.get("agent_session") or {}).get("value")
         path = usage = None
-        if a["agent"] == "claude" and sess and (path := claude_path(sess)):
+        if a["agent"] == "claude" and (path := claude_path(kind, sess)):
             prompt, now, ts = claude_activity(path)
             usage = claude_usage(path)
-        elif a["agent"] == "codex" and (path := codex_path(a.get("cwd"))):
+        elif a["agent"] == "codex" and (path := codex_path(a.get("cwd"), kind, sess)):
             prompt, now, ts = codex_activity(path)
             usage = codex_usage(path)
         else:
@@ -444,9 +490,13 @@ def build_rows(snap, ws=None):
                     + ([("CREW", " · ".join(x for x in (crew, role, lead and f"lead {lead}") if x))]
                        if role or crew else []),
         })
-    order = {"blocked": 0, "working": 1, "idle": 2, "done": 3}
-    rows.sort(key=lambda r: (order.get(r["status"], 4), r["pane"]))
+    rows.sort(key=lambda r: (ORDER.get(r["status"], len(ORDER)), pane_key(r["pane"])))
     return tree_order(rows)
+
+
+def pane_key(pane_id):
+    """w2:p10 -> ["w", 2, ":p", 10, ""], so w2 sorts before w10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", pane_id or "")]
 
 
 def tree_order(rows):
@@ -568,7 +618,7 @@ def init_colors():
     P = curses.color_pair
     return {
         "status": {"working": P(1) | curses.A_BOLD, "blocked": P(2) | curses.A_BOLD,
-                   "done": P(3), "idle": P(8)},
+                   "done": P(3), "idle": P(8), "unknown": P(8)},
         "agent": {"claude": P(4), "codex": P(5), "opencode": P(6), "pi": P(7)},
         "tool": P(5), "says": 0, "screen": P(8), "dim": P(8), "fresh": P(1),
         "ok": P(1), "warn": P(9), "bad": P(2) | curses.A_BOLD,
