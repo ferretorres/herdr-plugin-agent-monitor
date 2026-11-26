@@ -1,0 +1,19 @@
+id = "agent-monitor"
+name = "agent-monitor"
+version = "0.1.0"
+description = "What every agent on this herdr server is doing and using: goal, last prompt, current action, context, tokens, cost"
+min_herdr_version = "0.9.1"
+
+[[panes]]
+id = "monitor"
+title = "Agent monitor"
+command = ["python3", "monitor.py"]
+placement = "split"
+
+[[actions]]
+id = "open"
+title = "Agent monitor"
+description = "What every agent on this herdr server is doing and using: goal, last prompt, current action, context, tokens, cost"
+min_herdr_version = "0.9.1"
+command = ["herdr", "plugin", "pane", "open", "--plugin", "agent-monitor", "--entrypoint", "monitor"]
+contexts = ["global"]
