@@ -10,7 +10,7 @@ Views (v to switch): activity (goal, last prompt, current action) and usage (con
 Mouse: click a row for full details (click again to close), drag a header │ to resize,
        wheel to scroll. Keys: ↑↓ select · ⏎ jump to pane · v view · d details · esc close ·
        ←→ pick column · +/- width · 0 fill · space hide/show · q quit.
-Column widths persist in columns.json; prices (USD per 1M tokens) in prices.json, both next to this file.
+Column widths persist in columns.json under the plugin state dir; prices (USD per 1M tokens) in prices.json next to this file.
 PANE is coloured per workspace like ferretorres/herdr-plugin-space-colors (its config if present).
 Run `monitor.py --once [--usage]` for a single plain-text frame.
 """
@@ -682,14 +682,24 @@ def frame(rows, cols, width):
     return [l[:width] for l in lines]
 
 
-SETTINGS = os.path.join(HERE, "columns.json")
+def state_dir():
+    """HERDR_PLUGIN_STATE_DIR in a plugin pane, else ${XDG_STATE_HOME:-~/.local/state}/herdr/plugins/agent-monitor.
+    Not the plugin dir: an installed plugin's dir is replaced on update."""
+    if os.environ.get("HERDR_PLUGIN_STATE_DIR"):
+        return os.environ["HERDR_PLUGIN_STATE_DIR"]
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "herdr", "plugins", "agent-monitor")
 
 
 def load_cols():
-    try:
-        saved = json.load(open(SETTINGS))
-    except (OSError, ValueError):
-        saved = {}
+    saved = {}
+    for path in (os.path.join(state_dir(), "columns.json"), os.path.join(HERE, "columns.json")):  # 0.1 kept it in HERE
+        try:
+            with open(path) as f:
+                saved = json.load(f)
+            break
+        except (OSError, ValueError):
+            continue
     if not isinstance(saved, dict):
         saved = {}  # older single-view format
     return {v: saved[v] if [c[0] for c in saved.get(v, [])] == [c[0] for c in d] else [c[:] for c in d]
@@ -697,8 +707,22 @@ def load_cols():
 
 
 def save_cols(colsets):
-    with open(SETTINGS, "w") as f:
-        json.dump(colsets, f)
+    """Write via a temp file + rename, so monitors in other panes never read half a file.
+    False when it could not be saved (read-only disk...); the widths still apply in this pane."""
+    folder = state_dir()
+    tmp = os.path.join(folder, f".columns.{os.getpid()}.tmp")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(colsets, f)
+        os.replace(tmp, os.path.join(folder, "columns.json"))
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def parse_mouse(seq):

@@ -285,6 +285,24 @@ assert "w1:p2" not in monitor._screen                           # gone pane forg
 monitor.screen_activity = real_screen
 print("ok")
 
+# --- column widths: plugin state dir, atomic write, no crash ---------------------------------------
+sd = tempfile.mkdtemp()
+os.environ["HERDR_PLUGIN_STATE_DIR"] = os.path.join(sd, "plugin")
+assert monitor.state_dir() == os.path.join(sd, "plugin")
+cols = monitor.load_cols()
+cols["activity"][3][1] = 9
+assert monitor.save_cols(cols)
+assert os.listdir(os.path.join(sd, "plugin")) == ["columns.json"]          # no temp file left
+assert monitor.load_cols()["activity"][3][1] == 9
+os.environ.pop("HERDR_PLUGIN_STATE_DIR")
+os.environ["XDG_STATE_HOME"] = os.path.join(sd, "xdg")
+assert monitor.state_dir() == os.path.join(sd, "xdg", "herdr", "plugins", "agent-monitor")
+open(os.path.join(sd, "blocker"), "w").close()
+os.environ["XDG_STATE_HOME"] = os.path.join(sd, "blocker")                  # a file, not a dir
+assert monitor.save_cols(cols) is False                                    # reported, not raised
+os.environ.pop("XDG_STATE_HOME")
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"
