@@ -168,6 +168,36 @@ assert [r["pane"] for r in rows] == ["w2:p1"] and label == "workspace two (w2)",
 os.environ.pop("AGENT_MONITOR_SCOPE")
 print("ok")
 
+# --- crew hierarchy, agent name, title ------------------------------------------------------------
+def crew(role, lead=None):
+    t = {"crew_role": role, "crew_name": "kit"}
+    return dict(t, crew_lead=lead) if lead else t
+
+
+CREW = {"agents": [agent("w1:p4", tokens=crew("worker", "w1:p2"), name="alpha-tests"),
+                   agent("w1:p2", "claude", "working", tokens=crew("lead"), title="Ship the kit",
+                         terminal_title_stripped="user@host:/x"),
+                   agent("w1:p3", tokens=crew("worker", "w1:p2"), terminal_title_stripped="user@host:/y"),
+                   agent("w1:p5", tokens=crew("worker", "w1:p4")),          # a worker's worker
+                   agent("w2:p1", tokens=crew("worker", "w1:p2")),          # its lead is out of scope
+                   agent("w3:p1", tokens=crew("worker", "w3:p2")), agent("w3:p2", tokens=crew("worker", "w3:p1"))],
+        "panes": [], "workspaces": []}
+rows = monitor.build_rows(CREW)
+order = [(r["pane"], r["depth"]) for r in rows]
+assert order[:5] == [("w1:p2", 0), ("w1:p3", 1), ("w1:p4", 1), ("w1:p5", 2), ("w2:p1", 1)], order
+assert order[5:] == [("w3:p1", 0), ("w3:p2", 1)], order    # a lead cycle is cut, every row shown once
+cells = {r["pane"]: r["cells"] for r in rows}
+assert cells["w1:p3"]["PANE"] == "└ w1:p3" and cells["w1:p5"]["PANE"] == "  └ w1:p5"
+assert cells["w1:p4"]["AGENT"] == "alpha-tests" and cells["w1:p3"]["AGENT"] == "pi"   # name, else kind
+assert cells["w1:p2"]["GOAL"] == "Ship the kit" and cells["w1:p3"]["GOAL"] == "user@host:/y"
+assert dict(next(r for r in rows if r["pane"] == "w1:p4")["full"])["CREW"] == "kit · worker · lead w1:p2"
+# out of scope: the worker becomes a root
+assert [(r["pane"], r["depth"]) for r in monitor.build_rows(CREW, "w2")] == [("w2:p1", 0)]
+# PANE widens for the deepest indented id; the header row shows it whole
+assert dict(monitor.fit_cols(monitor.VIEWS["activity"], rows))["PANE"] == len("  └ w1:p5")
+assert "  └ w1:p5 " in "\n".join(monitor.frame(rows, monitor.VIEWS["activity"], 200))
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"

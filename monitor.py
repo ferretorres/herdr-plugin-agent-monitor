@@ -21,8 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GLYPH = {"working": "●", "blocked": "▲", "idle": "○", "done": "✓"}
 # per view: [name, width]; width 0 = share the rest, -1 = hidden
 VIEWS = {
-    "activity": [["ST", 2], ["PANE", 7], ["AGENT", 8], ["AGE", 5], ["GOAL", 34], ["LAST PROMPT", 40], ["NOW", 0]],
-    "usage": [["ST", 2], ["PANE", 7], ["AGENT", 8], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
+    "activity": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["AGE", 5], ["GOAL", 34], ["LAST PROMPT", 40], ["NOW", 0]],
+    "usage": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
               ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]],
 }
 # Anthropic first-party list prices, USD per 1M tokens (claude-api skill, cached 2026-11-03).
@@ -416,7 +416,9 @@ def build_rows(snap, ws=None):
         usd = cost(usage, price) if usage else None
         pct = 100 * usage["ctx"] / window if usage and window and usage["ctx"] else None
         u = usage or {}
-        goal = a.get("terminal_title_stripped") or ""
+        goal = a.get("title") or a.get("terminal_title_stripped") or ""  # title: report-metadata --title
+        tokens = a.get("tokens") or {}
+        role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
         palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"),
                              (spaces.get(a.get("workspace_id")) or {}).get("tokens"))
         if not palette:
@@ -425,10 +427,10 @@ def build_rows(snap, ws=None):
             palette = hashed.get(a.get("workspace_id"))
         rows.append({
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
-            "space": palette,
+            "space": palette, "parent": lead if role == "worker" else None,
             "pct": pct, "usd": usd, "usage": usage,
             "cells": {
-                "ST": GLYPH.get(a["agent_status"], "?"), "PANE": a["pane_id"], "AGENT": a["agent"],
+                "ST": GLYPH.get(a["agent_status"], "?"), "PANE": a["pane_id"], "AGENT": a.get("name") or a["agent"],
                 "AGE": ago(ts), "GOAL": one_line(goal), "LAST PROMPT": one_line(prompt), "NOW": one_line(now),
                 "MODEL": u.get("model", ""), "CTX": num(u.get("ctx")),
                 "CTX%": f"{pct:.0f}%" if pct is not None else "",
@@ -438,11 +440,46 @@ def build_rows(snap, ws=None):
             },
             "full": [("GOAL", goal), ("LAST PROMPT", prompt or ""), ("NOW", now or ""),
                      ("USAGE", usage_text(usage, window, usd)),
-                     ("WHERE", f'{a["pane_id"]} · {a.get("cwd", "")}' + (f" · {path}" if path else ""))],
+                     ("WHERE", f'{a["pane_id"]} · {a.get("cwd", "")}' + (f" · {path}" if path else ""))]
+                    + ([("CREW", " · ".join(x for x in (crew, role, lead and f"lead {lead}") if x))]
+                       if role or crew else []),
         })
     order = {"blocked": 0, "working": 1, "idle": 2, "done": 3}
     rows.sort(key=lambda r: (order.get(r["status"], 4), r["pane"]))
-    return rows
+    return tree_order(rows)
+
+
+def tree_order(rows):
+    """Each lead followed by its workers (crew_lead token = the lead's pane id), depth-first,
+    indented with └ in PANE. A worker whose lead is not shown is a root; cycles are cut."""
+    shown = {r["pane"] for r in rows}
+    kids = {}
+    for r in rows:
+        parent = r.get("parent") if r.get("parent") in shown and r.get("parent") != r["pane"] else None
+        kids.setdefault(parent, []).append(r)
+    out, seen = [], set()
+
+    def walk(r, depth):
+        if r["pane"] in seen:
+            return
+        seen.add(r["pane"])
+        r["depth"] = depth
+        r["cells"]["PANE"] = "  " * (depth - 1) + "└ " + r["pane"] if depth else r["pane"]
+        out.append(r)
+        for k in kids.get(r["pane"], []):
+            walk(k, depth + 1)
+
+    for r in kids.get(None, []):
+        walk(r, 0)
+    for r in rows:  # only reachable through a cycle: start it as a root
+        walk(r, 0)
+    return out
+
+
+def fit_cols(cols, rows, cap=24):
+    """cols with PANE widened to fit indented ids (fixed widths only, never narrower)."""
+    need = max((len(r["cells"]["PANE"]) for r in rows), default=0)
+    return [[n, min(max(wd, need), cap) if n == "PANE" and wd > 0 else wd] for n, wd in cols]
 
 
 def usage_text(u, window, usd):
@@ -483,6 +520,7 @@ def layout(cols, width):
 
 
 def frame(rows, cols, width):
+    cols = fit_cols(cols, rows)
     spec = layout(cols, width)
     lines = [" ".join(fit(cols[i][0], w) for i, _, w in spec)]
     for r in rows:
@@ -641,7 +679,7 @@ def tui(scr):
         list_h = body // 2 if detail and rows else body
         scr.erase()
         scr.addnstr(0, 0, f" agent monitor · {state['scope']} · {len(rows)} agents", w - 1, curses.A_BOLD)
-        spec = layout(cols, w - 1)
+        spec = layout(fit_cols(cols, rows), w - 1)
         for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
             if x < w - 1:
                 attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
