@@ -74,9 +74,11 @@ NOT_RUNNING = '{"id":"x","error":{"code":"server_not_running","message":"no herd
 # HERDR_BIN_PATH picks the binary; without it, "herdr" from PATH.
 env = dict(os.environ, HERDR_BIN_PATH="/opt/x/herdr")
 assert subprocess.run([sys.executable, "-c", "import monitor; print(monitor.HERDR)"], env=env,
+                      cwd=os.path.dirname(os.path.abspath(__file__)),
                       capture_output=True, text=True).stdout.strip() == "/opt/x/herdr"
 env.pop("HERDR_BIN_PATH")
 assert subprocess.run([sys.executable, "-c", "import monitor; print(monitor.HERDR)"], env=env,
+                      cwd=os.path.dirname(os.path.abspath(__file__)),
                       capture_output=True, text=True).stdout.strip() == "herdr"
 
 # A non-zero exit with herdr's JSON error becomes HerdrError("code: message"), not an empty list.
