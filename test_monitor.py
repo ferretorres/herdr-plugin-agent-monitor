@@ -319,6 +319,52 @@ assert state["data"][0] == ["row"] and "KeyError" in state["data"][1], state
 monitor.collect = real_collect
 print("ok")
 
+# --- tiny and narrow panes: the TUI keeps running ---------------------------------------------------
+import curses
+
+
+class FakeScreen:
+    """Raises curses.error where real curses does: outside the window, or writing the last cell."""
+    def __init__(self, h, w, keys):
+        self.h, self.w, self.keys = h, w, list(keys)
+
+    def getmaxyx(self):
+        return self.h, self.w
+
+    def _check(self, y, x, n):
+        if not (0 <= y < self.h and 0 <= x < self.w) or n < 0 or (y == self.h - 1 and x + n >= self.w):
+            raise curses.error("out of window")
+
+    def addnstr(self, y, x, text, n, attr=0):
+        self._check(y, x, min(len(text), n) if n >= 0 else len(text))
+
+    def addstr(self, y, x, text, attr=0):
+        self._check(y, x, len(text))
+
+    def hline(self, y, x, ch, n):
+        self._check(y, x, n)
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else ord("q")
+
+    keypad = timeout = nodelay = erase = refresh = lambda self, *a: None
+
+
+C0 = {"status": {}, "agent": {}, "tool": 0, "says": 0, "screen": 0, "dim": 0, "fresh": 0, "ok": 0, "warn": 0,
+      "bad": 0, "space": {}}
+saved_fns = (monitor.init_colors, monitor.refresh_forever, curses.curs_set, getattr(curses, "ACS_HLINE", None))
+monitor.init_colors = lambda: C0
+curses.curs_set = lambda n: None
+curses.ACS_HLINE = ord("-")
+crew_rows = monitor.build_rows(CREW)
+monitor.refresh_forever = lambda state, every=2.0: state.update(data=(crew_rows, ""), scope="workspace one (w1)")
+for h in range(1, 9):
+    for w in (1, 2, 5, 11, 12, 20, 40):
+        for keys in ([], [ord("d"), -1], [ord("v"), -1], [ord("v"), ord("d"), -1]):
+            monitor.tui(FakeScreen(h, w, keys))          # no curses.error escapes
+monitor.init_colors, monitor.refresh_forever, curses.curs_set = saved_fns[:3]
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"

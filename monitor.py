@@ -848,6 +848,33 @@ def refresh_once(state):
         state["data"] = (state["data"][0], f" ⚠ monitor error: {type(e).__name__}: {one_line(str(e), 120)} ·")
 
 
+def draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w):
+    scr.addnstr(0, 0, f" agent monitor · {state['scope']} · {len(rows)} agents", w - 1, curses.A_BOLD)
+    for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
+        if x < w - 1:
+            attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
+            scr.addnstr(1, x, fit(cols[i][0], cw), w - 1 - x, attr)
+            if x + cw < w - 1:
+                scr.addstr(1, x + cw, "│", C["dim"])
+    for n, r in enumerate(rows[first:first + list_h]):
+        y, rev = n + 2, curses.A_REVERSE if first + n == sel else 0
+        for i, x, cw in spec:
+            if x < w - 1:
+                name = cols[i][0]
+                scr.addnstr(y, x, fit(r["cells"][name], cw) + " ", w - 1 - x, cell_attr(C, r, name) | rev)
+    if not rows and not warn and list_h > 0:
+        scr.addnstr(2, 1, f"no agents in {state['scope']}", w - 2, C["dim"])
+    if detail and rows and body - list_h >= 2:
+        draw_detail(scr, rows[sel], list_h + 2, body + 3, w, C)
+    if view == "usage" and h >= 4:
+        scr.addnstr(h - 2, 0, totals(rows), w - 1, curses.A_BOLD)
+    hidden = ",".join(c[0] for c in cols if c[1] == -1)
+    help_ = (f" [{view}] v: switch view · click row: details · drag │: width"
+             f" · ⏎ jump · ←→ +/- space: column · q quit")
+    scr.addnstr(h - 1, 0, warn + help_ + (f" · hidden: {hidden}" if hidden else ""), w - 1,
+                C["warn"] if warn else C["dim"])
+
+
 def tui(scr):
     curses.curs_set(0)
     C = init_colors()
@@ -868,35 +895,19 @@ def tui(scr):
         sel = min(sel, max(0, len(rows) - 1))
         picked = min(picked, len(cols) - 1)
         # rows: 0 title (scope), 1 column header, 2.. agents, then [usage totals], status line
-        body = h - 4 if view == "usage" else h - 3
+        body = max(0, h - 4 if view == "usage" else h - 3)
         list_h = body // 2 if detail and rows else body
-        scr.erase()
-        scr.addnstr(0, 0, f" agent monitor · {state['scope']} · {len(rows)} agents", w - 1, curses.A_BOLD)
-        spec = layout(fit_cols(cols, rows), w - 1)
-        for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
-            if x < w - 1:
-                attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
-                scr.addnstr(1, x, fit(cols[i][0], cw), w - 1 - x, attr)
-                if x + cw < w - 1:
-                    scr.addstr(1, x + cw, "│", C["dim"])
         first = max(0, sel - list_h + 1)
-        for n, r in enumerate(rows[first:first + list_h]):
-            y, rev = n + 2, curses.A_REVERSE if first + n == sel else 0
-            for i, x, cw in spec:
-                if x < w - 1:
-                    name = cols[i][0]
-                    scr.addnstr(y, x, fit(r["cells"][name], cw) + " ", w - 1 - x, cell_attr(C, r, name) | rev)
-        if not rows and not warn and list_h > 0:
-            scr.addnstr(2, 1, f"no agents in {state['scope']}", w - 2, C["dim"])
-        if detail and rows:
-            draw_detail(scr, rows[sel], list_h + 2, body + 3, w, C)
-        if view == "usage":
-            scr.addnstr(h - 2, 0, totals(rows), w - 1, curses.A_BOLD)
-        hidden = ",".join(c[0] for c in cols if c[1] == -1)
-        help_ = (f" [{view}] v: switch view · click row: details · drag │: width"
-                 f" · ⏎ jump · ←→ +/- space: column · q quit")
-        scr.addnstr(h - 1, 0, warn + help_ + (f" · hidden: {hidden}" if hidden else ""), w - 1,
-                    C["warn"] if warn else C["dim"])
+        spec = layout(fit_cols(cols, rows), max(1, w - 1))
+        scr.erase()
+        try:
+            if h < 3 or w < 12:  # too small for a table: say so, keep handling keys
+                scr.addnstr(0, 0, "agent monitor: pane too small", max(1, w - 1))
+            else:
+                draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w)
+        except curses.error:
+            pass  # a resize landed mid-draw; the next frame redraws at the new size
+        scr.refresh()
         k = scr.getch()
         if k == 27:  # Esc alone, or the start of a mouse report
             scr.nodelay(True)
