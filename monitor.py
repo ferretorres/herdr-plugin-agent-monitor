@@ -337,23 +337,40 @@ def choose_palette(label, cwd, accents, rules, auto):
     # ponytail: the plugin's per-pane [[agents]] overrides are not applied; add if someone uses them
 
 
-def workspace_palettes(accents, rules, auto):
-    try:
-        panes = herdr_json("pane", "list").get("panes") or []
-        spaces = herdr_json("workspace", "list").get("workspaces") or []
-    except HerdrError:
-        return {}
+def workspace_palettes(panes, spaces, accents, rules, auto):
+    """Fallback when space-colors is not installed: its hash, from the first non-empty pane cwd."""
     first_cwd = {}
     for p in panes:
-        first_cwd.setdefault(p["workspace_id"], p.get("cwd") or "")
+        if p.get("cwd"):
+            first_cwd.setdefault(p.get("workspace_id"), p["cwd"])
     return {w["workspace_id"]: choose_palette(w.get("label", ""), first_cwd.get(w["workspace_id"], ""),
                                               accents, rules, auto) for w in spaces}
 
 
+def sc_palette(*token_maps):
+    """Palette name from the space-colors token (sc_<palette> = "●"), first map that has one."""
+    for tokens in token_maps:
+        name = next((k[3:] for k in sorted(tokens or {}) if k.startswith("sc_") and len(k) > 3), None)
+        if name:
+            return name
+    return None
+
+
+def snapshot():
+    """agents, panes, workspaces and tabs in one herdr call."""
+    return herdr_json("api", "snapshot").get("snapshot") or {}
+
+
 def collect():
-    agents = herdr_json("agent", "list").get("agents") or []  # HerdrError -> warning line
+    return build_rows(snapshot())
+
+
+def build_rows(snap):
+    agents = snap.get("agents") or []
+    panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
+    spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
+    hashed = None  # space-colors' own choice is on every pane as a token; hash only without it
     prices = load_prices()
-    space = workspace_palettes(*load_space_colors())
     rows = []
     for a in agents:
         sess = (a.get("agent_session") or {}).get("value")
@@ -372,9 +389,15 @@ def collect():
         pct = 100 * usage["ctx"] / window if usage and window and usage["ctx"] else None
         u = usage or {}
         goal = a.get("terminal_title_stripped") or ""
+        palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"),
+                             (spaces.get(a.get("workspace_id")) or {}).get("tokens"))
+        if not palette:
+            if hashed is None:
+                hashed = workspace_palettes(panes.values(), spaces.values(), *load_space_colors())
+            palette = hashed.get(a.get("workspace_id"))
         rows.append({
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
-            "space": space.get(a.get("workspace_id")),
+            "space": palette,
             "pct": pct, "usd": usd, "usage": usage,
             "cells": {
                 "ST": GLYPH.get(a["agent_status"], "?"), "PANE": a["pane_id"], "AGENT": a["agent"],

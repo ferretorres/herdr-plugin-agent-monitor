@@ -107,6 +107,33 @@ with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
 assert "server_not_running" in err.getvalue()
 print("ok")
 
+# --- one snapshot per refresh, colours from space-colors tokens ----------------------------------
+def agent(pane, kind="pi", status="idle", **kw):
+    return dict({"pane_id": pane, "agent": kind, "agent_status": status, "workspace_id": pane.split(":")[0],
+                 "cwd": "/tmp/" + pane}, **kw)
+
+
+SNAP = {"agents": [agent("w1:p1", tokens={"sc_teal": "●"}), agent("w1:p2"), agent("w2:p1")],
+        "panes": [{"pane_id": "w1:p2", "workspace_id": "w1", "cwd": "/a", "tokens": {"sc_pink": "●"}},
+                  {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": "", "tokens": {}},
+                  {"pane_id": "w2:p9", "workspace_id": "w2", "cwd": "/b/c"}],
+        "workspaces": [{"workspace_id": "w1", "label": "one", "tokens": {"sc_red": "●"}},
+                       {"workspace_id": "w2", "label": "two"}], "tabs": []}
+monitor.HERDR = fake_herdr({"api snapshot": (0, json.dumps({"id": "s", "result": {"type": "session_snapshot", "snapshot": SNAP}})),
+                            "agent read": (0, "some screen output here\n")})
+calls = []
+real = monitor.herdr
+monitor.herdr = lambda *a, **k: (calls.append(a[:2]), real(*a, **k))[1]
+rows = {r["pane"]: r for r in monitor.collect()}
+assert sum(1 for c in calls if c != ("agent", "read")) == 1, calls          # only `api snapshot`
+monitor.herdr = real
+assert rows["w1:p1"]["space"] == "teal"     # the agent's own token
+assert rows["w1:p2"]["space"] == "pink"     # else the pane's token
+# no token anywhere: space-colors' hash of the first non-empty pane cwd in that workspace
+assert rows["w2:p1"]["space"] == names[fnv1a("/b/c") % 8], rows["w2:p1"]["space"]
+assert monitor.sc_palette({"x": "1"}, {"sc_my-own": "●"}) == "my-own" and monitor.sc_palette({}) is None
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"
