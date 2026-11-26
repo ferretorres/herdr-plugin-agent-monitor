@@ -303,6 +303,22 @@ assert monitor.save_cols(cols) is False                                    # rep
 os.environ.pop("XDG_STATE_HOME")
 print("ok")
 
+# --- odd records after a server restart never kill the refresh -------------------------------------
+monitor.HERDR = fake_herdr({"agent read": (0, "")})
+odd = {"agents": [{"pane_id": "w1:p7", "workspace_id": "w1", "agent_status": "idle"},   # no "agent"
+                  {"pane_id": "w1:p8", "workspace_id": "w1"},                          # no kind, no status
+                  {"workspace_id": "w1"}, "junk", agent("w1:p1")]}
+rows = monitor.build_rows(odd)
+assert sorted(r["pane"] for r in rows) == ["w1:p1", "w1:p7", "w1:p8"], [r["pane"] for r in rows]
+assert next(r for r in rows if r["pane"] == "w1:p8")["cells"]["ST"] == "◌"
+real_collect = monitor.collect
+monitor.collect = lambda *a, **k: (_ for _ in ()).throw(KeyError("agent"))
+state = {"data": (["row"], "")}
+monitor.refresh_once(state)                                   # any exception: warning, rows kept
+assert state["data"][0] == ["row"] and "KeyError" in state["data"][1], state
+monitor.collect = real_collect
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"

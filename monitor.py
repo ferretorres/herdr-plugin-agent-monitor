@@ -538,8 +538,18 @@ def transcript(a):
     return None
 
 
+def agent_entry(a):
+    """The agent record with the fields the monitor needs, or None. herdr can list entries
+    without an `agent` kind (e.g. a pane whose resume failed after a server restart)."""
+    if not isinstance(a, dict) or not a.get("pane_id"):
+        return None
+    return dict(a, agent=a.get("agent") or a.get("display_agent") or "?",
+                agent_status=a.get("agent_status") or "unknown")
+
+
 def build_rows(snap, ws=None, wait=False):
-    agents = [a for a in snap.get("agents") or [] if ws is None or a.get("workspace_id") == ws]
+    agents = [e for e in map(agent_entry, snap.get("agents") or [])
+              if e and (ws is None or e.get("workspace_id") == ws)]
     found = {a["pane_id"]: transcript(a) for a in agents}
     screens = {a["pane_id"]: screen_start(a) for a in agents if not found[a["pane_id"]]}
     if wait:
@@ -819,7 +829,10 @@ def refresh_forever(state, every=2.0):
     """Background thread: collect() off the UI thread, so a slow herdr never freezes keys or mouse.
     The UI only reads state["data"]; one assignment of a tuple, so no lock is needed."""
     while True:
-        refresh_once(state)
+        try:
+            refresh_once(state)
+        except Exception as e:  # never let the thread die: the screen would freeze on old rows
+            state["data"] = (state["data"][0], f" ⚠ monitor error: {type(e).__name__}: {e} ·")
         time.sleep(every)
 
 
@@ -831,6 +844,8 @@ def refresh_once(state):
         state["data"] = (state["data"][0], f" ⚠ herdr did not answer: {' '.join(e.cmd[1:3])} ·")
     except HerdrError as e:  # e.g. server_not_running: say so instead of showing 0 agents
         state["data"] = (state["data"][0], f" ⚠ herdr: {e} ·")
+    except Exception as e:  # an unexpected record or file: report it, keep the last rows, retry
+        state["data"] = (state["data"][0], f" ⚠ monitor error: {type(e).__name__}: {one_line(str(e), 120)} ·")
 
 
 def tui(scr):
