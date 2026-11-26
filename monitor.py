@@ -110,9 +110,11 @@ def tail_lines(path, size=400_000):
     out = []
     for line in data:
         try:
-            out.append(json.loads(line))
+            o = json.loads(line)
         except ValueError:
-            pass  # first line is usually cut by the seek
+            continue  # first line is usually cut by the seek
+        if isinstance(o, dict):
+            out.append(o)
     return out
 
 
@@ -140,10 +142,13 @@ def _stream(path, ino, off):
             if not line.endswith(b"\n"):
                 break  # a line still being written: read it next time
             off += len(line)
+            _new[path] = (ino, off)  # per line: a reader that fails on one never re-counts the others
             try:
-                yield json.loads(line)
+                o = json.loads(line)
             except ValueError:
-                pass
+                continue
+            if isinstance(o, dict):
+                yield o
     _new[path] = (ino, off)
 
 
@@ -242,15 +247,23 @@ _cu = {}  # transcript path -> running usage
 def claude_file_usage(path):
     """Sum usage over a Claude transcript. One API reply is written as several lines with the
     same message id, so count each id once, using the last line seen for it."""
-    fresh = lambda: {"tot": [0] * 5, "id": None, "cur": [0] * 5, "ctx": 0, "model": ""}
+    fresh = lambda: {"tot": [0] * 5, "id": None, "cur": [0] * 5, "ctx": 0, "model": "", "prompt": ""}
     st = _cu.setdefault(path, fresh())
     objs, rewound = new_lines(path)
     if rewound:
         st = _cu[path] = fresh()
     for o in objs:
-        msg = o.get("message") or {}
+        msg = _obj(o.get("message"))
+        if o.get("type") == "user" or o.get("type") == "last-prompt":
+            text = o.get("lastPrompt") if o.get("type") == "last-prompt" else msg.get("content")
+            texts = [text] if isinstance(text, str) else [
+                c.get("text", "") for c in text or [] if isinstance(c, dict) and c.get("type") == "text"]
+            texts = [t for t in texts if isinstance(t, str) and is_human(t)]
+            if texts:
+                st["prompt"] = texts[-1]
+            continue
         u = msg.get("usage")
-        if o.get("type") != "assistant" or not u:
+        if o.get("type") != "assistant" or not isinstance(u, dict):
             continue
         if msg.get("id") != st["id"]:
             st["tot"] = [a + b for a, b in zip(st["tot"], st["cur"])]
@@ -259,6 +272,10 @@ def claude_file_usage(path):
         st["ctx"] = sum(st["cur"][:4])
         st["model"] = msg.get("model") or st["model"]
     return [a + b for a, b in zip(st["tot"], st["cur"])], st["ctx"], st["model"]
+
+
+def _obj(v):
+    return v if isinstance(v, dict) else {}
 
 
 def claude_reply_usage(u):
@@ -286,7 +303,8 @@ def claude_usage(path):
     for p in subs:  # subagents bill tokens too, but don't use this session's context
         tot = [a + b for a, b in zip(tot, claude_file_usage(p)[0])]
     return {"in": tot[0], "cr": tot[1], "cw": tot[2] + tot[3], "cw5m": tot[2], "cw1h": tot[3],
-            "out": tot[4], "ctx": ctx, "model": model, "window": None, "subagents": len(subs)}
+            "out": tot[4], "ctx": ctx, "model": model, "window": None, "subagents": len(subs),
+            "prompt": _cu.get(path, {}).get("prompt", "")}
 
 
 _codex_cwd = {}  # rollout path -> cwd (session_meta is the first line, never changes)
@@ -366,8 +384,8 @@ def codex_usage(path):
     if rewound:
         st = _xu[path] = {"info": None, "model": ""}
     for o in objs:
-        p = o.get("payload") or {}
-        if p.get("type") == "token_count" and p.get("info"):
+        p = _obj(o.get("payload"))
+        if p.get("type") == "token_count" and isinstance(p.get("info"), dict):
             st["info"] = p["info"]
         elif o.get("type") == "turn_context":
             st["model"] = p.get("model") or st["model"]
@@ -427,6 +445,10 @@ def _pi_activity(path):
 
 
 _pu = {}  # pi session path -> running usage
+
+
+def _n(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
 _pi_models = {"mtime": None, "windows": {}}
 
 
@@ -457,7 +479,7 @@ def pi_usage(path):
     if rewound:
         st = _pu[path] = fresh()
     for o in objs:
-        kind, m = o.get("type"), o.get("message") or {}
+        kind, m = o.get("type"), _obj(o.get("message"))
         u = None
         if kind == "message" and m.get("role") in ("assistant", "toolResult"):
             u = m.get("usage")
@@ -467,9 +489,10 @@ def pi_usage(path):
             st["ctx"] = None
         if not isinstance(u, dict):
             continue
-        vals = [u.get("input") or 0, u.get("cacheRead") or 0, u.get("cacheWrite") or 0, u.get("output") or 0]
+        vals = [_n(u.get("input")), _n(u.get("cacheRead")), _n(u.get("cacheWrite")), _n(u.get("output"))]
         st["tot"] = [a + b for a, b in zip(st["tot"], vals)]
-        st["usd"] += ((u.get("cost") or {}).get("total") or 0) if isinstance(u.get("cost"), dict) else 0
+        usd = u["cost"].get("total") if isinstance(u.get("cost"), dict) else 0
+        st["usd"] += usd if isinstance(usd, (int, float)) else 0
         if kind == "message" and m.get("role") == "assistant" and m.get("stopReason") not in ("aborted", "error"):
             ctx = u.get("totalTokens") or sum(vals)
             if ctx:
@@ -653,13 +676,20 @@ def config_dir():
 
 def load_prices():
     """Built-in prices, then prices.json next to this file, then prices.json in the config folder."""
-    prices = dict(PRICES)
+    prices = {k: dict(v) for k, v in PRICES.items()}
     for folder in (HERE, config_dir()):
         try:
             with open(os.path.join(folder, "prices.json")) as f:
-                prices.update(json.load(f))
+                data = json.load(f)
         except (OSError, ValueError):
-            pass
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key, entry in data.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue  # a malformed entry is skipped, never a crash for every row
+            nums = {f: v for f, v in entry.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            prices[key] = dict(prices.get(key, {}), **nums)  # keys left out keep their built-in values
     return prices
 
 
@@ -805,6 +835,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         if path and a["agent"] == "claude":
             prompt, now, ts = claude_activity(path)
             usage = claude_usage(path)
+            prompt = prompt or usage.get("prompt", "")  # big attachments can push it out of the tail
         elif path and a["agent"] == "pi":
             prompt, now, ts = pi_activity(path)
             usage = pi_usage(path)
@@ -906,7 +937,7 @@ def usage_text(u, window, usd, src="list"):
     else:
         money = f"≈ ${usd:.2f} {COST_SOURCE.get(src, 'at list price')}"
         if u.get("cw1h"):
-            money += " (cache writes: 1h at 2× input, 5m at 1.25×)"
+            money += " (1h and 5m cache writes priced apart)"
     split = f" (1h {u['cw1h']:,} · 5m {u.get('cw5m', 0):,})" if u.get("cw1h") else ""
     subs = f" · includes {u['subagents']} subagent sessions" if u["subagents"] else ""
     return (f"{u['model']} · {ctx}\ninput {u['in']:,} · cache read {u['cr']:,} · cache write {u['cw']:,}{split}"
@@ -1088,6 +1119,7 @@ def draw_detail(scr, row, top, h, w, C):
 # The monitor writes only its own am_* pane tokens (source ferretorres.agent-monitor), never state
 # labels, titles or other plugins' keys: the crew plugin owns the labels and rewrites them.
 SIDEBAR_KEYS = ("am_bad", "am_warn", "am_ok")
+TOAST_RETRY_S = 60  # a toast herdr declined (toasts off, no client attached) is retried this often
 PAD = "\u2800"  # herdr trims leading spaces in sidebar rows, not this blank
 
 
@@ -1171,6 +1203,15 @@ def toast_due(row):
         os.makedirs(os.path.dirname(marker), exist_ok=True)
         os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     except FileExistsError:
+        # herdr declined it (toasts off, nobody attached): try again now and then, not every refresh
+        try:
+            with open(marker) as f:
+                waiting = f.read().startswith("retry")
+            if waiting and time.time() - os.path.getmtime(marker) > TOAST_RETRY_S:
+                os.utime(marker)
+                return True
+        except OSError:
+            pass
         return False
     except OSError:
         return False
@@ -1184,27 +1225,35 @@ def send_toast(row):
                          "--sound", "none")
     except (HerdrError, subprocess.TimeoutExpired):
         out = {"reason": "busy"}
-    if not out.get("shown") and out.get("reason") in ("rate_limited", "busy"):
-        try:
-            os.unlink(toast_marker(row))  # try again on the next refresh or status change
-        except OSError:
-            pass
+    marker = toast_marker(row)
+    try:
+        if out.get("shown"):
+            with open(marker, "w") as f:
+                f.write("shown")
+        elif out.get("reason") in ("rate_limited", "busy"):
+            os.unlink(marker)  # try again on the next refresh or status change
+        else:  # disabled, no_foreground_client...: retry after TOAST_RETRY_S
+            with open(marker, "w") as f:
+                f.write(f"retry {out.get('reason', '')}")
+    except OSError:
+        pass
 
 
 def prune_markers(days=7):
-    folder = os.path.join(state_dir(), "sent")
-    try:
-        names = os.listdir(folder)
-    except OSError:
-        return
+    """Drop toast markers and hook read caches nobody touched for a week."""
     old = time.time() - days * 86400
-    for n in names:
-        p = os.path.join(folder, n)
+    for folder in (os.path.join(state_dir(), "sent"), os.path.join(state_dir(), "reads")):
         try:
-            if os.path.getmtime(p) < old:
-                os.unlink(p)
+            names = os.listdir(folder)
         except OSError:
-            pass
+            continue
+        for n in names:
+            p = os.path.join(folder, n)
+            try:
+                if os.path.getmtime(p) < old:
+                    os.unlink(p)
+            except OSError:
+                pass
 
 
 def publish(rows):
@@ -1239,9 +1288,49 @@ def hook():
         snap = snapshot()
     except (HerdrError, subprocess.TimeoutExpired):
         return 1
-    snap = dict(snap, agents=[a for a in snap.get("agents") or [] if isinstance(a, dict) and a.get("pane_id") == pane])
-    publish(build_rows(snap, wait=False, screens=False))
+    agents = [a for a in snap.get("agents") or [] if isinstance(a, dict) and a.get("pane_id") == pane]
+    if not agents:  # the agent exited: drop its sidebar line
+        p = next((p for p in snap.get("panes") or [] if p.get("pane_id") == pane), None)
+        stale = [k for k in ((p or {}).get("tokens") or {}) if k in SIDEBAR_KEYS]
+        if stale:
+            try:
+                herdr(*metadata_args(pane, {}, stale))
+            except (HerdrError, subprocess.TimeoutExpired):
+                pass
+        return 0
+    cache = os.path.join(state_dir(), "reads", hashlib.sha256(pane.encode()).hexdigest()[:16] + ".json")
+    load_reads(cache)
+    publish(build_rows(dict(snap, agents=agents), wait=False, screens=False))
+    save_reads(cache)
     return 0
+
+
+READ_CACHES = {"new": _new, "cu": _cu, "xu": _xu, "pu": _pu}
+
+
+def load_reads(path):
+    """The hook runs as a new process per event: restore where the last run stopped reading this
+    pane's session files, so it parses only what was added since."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        for name, cache in READ_CACHES.items():
+            for k, v in (data.get(name) or {}).items():
+                cache[k] = tuple(v) if name == "new" else v
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+
+
+def save_reads(path):
+    data = {name: {k: v for k, v in cache.items() if k in _new} for name, cache in READ_CACHES.items()}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def refresh_forever(state, every=2.0):

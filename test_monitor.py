@@ -543,6 +543,61 @@ base = {"usage": {"in": 1, "cr": 0, "cw": 0, "out": 1}}
 assert monitor.totals([dict(base, usd=1.0, usd_src="list")]).endswith("≈ $1.00 list price")
 assert "list price + agent-reported" in monitor.totals([dict(base, usd=1.0, usd_src="list"), dict(base, usd=2.0, usd_src="pi")])
 u = {"in": 1, "cr": 2, "cw": 30, "cw5m": 10, "cw1h": 20, "out": 3, "ctx": 6, "model": "m", "subagents": 0}
-assert "(1h 20 · 5m 10)" in monitor.usage_text(u, None, 1.0) and "1h at 2×" in monitor.usage_text(u, None, 1.0)
+assert "(1h 20 · 5m 10)" in monitor.usage_text(u, None, 1.0) and "priced apart" in monitor.usage_text(u, None, 1.0)
 assert "as recorded by pi" in monitor.usage_text(dict(u, cw1h=0), None, 1.0, "pi")
+print("ok")
+
+# --- review fixes --------------------------------------------------------------------------------
+# Malformed prices.json never breaks a refresh; a partial override keeps the built-in ctx.
+cfg = tempfile.mkdtemp()
+os.environ["HERDR_PLUGIN_CONFIG_DIR"] = cfg
+for bad in ("null", "[1, 2]", '{"opus-5-5": 5}', '{"opus-5-5": {"in": "3", "out": null, "ctx": "1"}}'):
+    with open(os.path.join(cfg, "prices.json"), "w") as f:
+        f.write(bad)
+    p = monitor.price_for("claude-opus-5-5", monitor.load_prices())
+    assert p["in"] == 4.0 and p["ctx"] == 1_000_000, (bad, p)
+with open(os.path.join(cfg, "prices.json"), "w") as f:
+    f.write('{"opus-5-5": {"in": 3}}')
+p = monitor.price_for("claude-opus-5-5", monitor.load_prices())
+assert (p["in"], p["out"], p["ctx"]) == (3, 20.0, 1_000_000)
+del os.environ["HERDR_PLUGIN_CONFIG_DIR"]
+
+# A line the reader cannot use is skipped once; earlier replies are never counted twice.
+t = jsonl([{"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 100}}}, [], "x",
+           {"type": "assistant", "message": "not an object"},
+           {"type": "assistant", "message": {"id": "m2", "usage": {"input_tokens": 100}}}])
+monitor._cu.clear(); monitor._new.clear()
+assert monitor.claude_file_usage(t)[0][0] == 200 and monitor.claude_file_usage(t)[0][0] == 200
+
+# LAST PROMPT survives being pushed out of the tail by large attachments.
+t = jsonl([{"type": "user", "message": {"content": "fix the login bug"}},
+           {"type": "attachment", "blob": "x" * 500_000},
+           {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1},
+                                              "content": [{"type": "text", "text": "ok"}]}}])
+monitor._cu.clear()
+assert monitor.claude_activity(t)[0] == "" and monitor.claude_usage(t)["prompt"] == "fix the login bug"
+
+# A toast herdr declined (toasts off, nobody attached) is retried later, not lost.
+os.environ["HERDR_PLUGIN_STATE_DIR"] = tempfile.mkdtemp()
+sent = []
+answers = [{"shown": False, "reason": "no_foreground_client"}, {"shown": True}]
+monitor.herdr_json = lambda *a: (sent.append(a), answers.pop(0))[1]
+r = dict(r, session="/declined.jsonl", pct=92.0)
+monitor.publish([r]); monitor.publish([r])
+assert len(sent) == 1                                     # not before TOAST_RETRY_S
+monitor.TOAST_RETRY_S = -1
+monitor.publish([r]); monitor.publish([r])
+assert len(sent) == 2                                     # retried once, then shown: no more
+monitor.TOAST_RETRY_S = 60
+
+# The hook keeps its read position between runs.
+t = jsonl([{"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 7}}}])
+monitor._cu.clear(); monitor._new.clear()
+monitor.claude_file_usage(t)
+cache = os.path.join(os.environ["HERDR_PLUGIN_STATE_DIR"], "reads", "p.json")
+monitor.save_reads(cache)
+monitor._cu.clear(); monitor._new.clear()
+monitor.load_reads(cache)
+assert monitor._new[t][1] > 0 and monitor.claude_file_usage(t)[0][0] == 7
+del os.environ["HERDR_PLUGIN_STATE_DIR"]
 print("ok")

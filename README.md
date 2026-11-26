@@ -30,8 +30,8 @@ ST PANE    AGENT        MODEL              CTX     CTX%  IN      CACHE R  CACHE 
 - **Per workspace**: scope it to one workspace, and agents that carry crew tokens show as a lead with its
   workers under it.
 
-- **In the sidebar**: an optional extra line under an agent once it nears a limit (context or cost), and a
-  toast when an agent's context passes 90%, both kept current even with no monitor pane open.
+- **In the sidebar**: an optional extra line under an agent once its context or session cost passes a
+  threshold, and a toast when an agent's context passes 90%, both kept current even with no monitor pane open.
 
 Each refresh (every 2 s) reads one `herdr api snapshot` and the agents' own session files: Claude Code
 transcripts, Codex rollouts, pi sessions and opencode's database. Other agents (OpenRouter CLIs and the like)
@@ -156,8 +156,8 @@ Python 3.11+, else its default accents). Without it, PANE is not coloured.
 
 ## Sidebar and toast
 
-The monitor puts one short line under an agent in herdr's sidebar when that agent needs watching, and
-nothing for a healthy one:
+The monitor puts one short line under an agent in herdr's sidebar when its context or session cost passes
+a threshold, and nothing otherwise:
 
 ```
 billing
@@ -178,7 +178,8 @@ It writes one of the tokens `am_bad`, `am_warn` (or `am_ok`, see below); add thi
 
 When an agent's context passes 90%, a toast says so once (`lead context 91%`, with its workspace, tab and
 pane), and again only after the context drops below 50% and climbs back. Herdr shows toasts only with
-`[ui.toast] delivery = "herdr"` (or `terminal` / `system`) in its config. Herdr already notifies you when an
+`[ui.toast] delivery = "herdr"` (or `terminal` / `system`) in its config. A toast herdr declines (toasts
+off, or no client attached) is tried again every minute while the context stays above 90%. Herdr already notifies you when an
 agent finishes or needs input, so the monitor does not repeat those.
 
 Both stay current without a monitor pane: a hook runs on every agent status change and updates that one
@@ -196,7 +197,7 @@ The hook only sees variables set in the herdr server's environment.
 
 COST uses Anthropic first-party list prices for Claude models, with 1-hour cache writes priced at 2× input and
 5-minute ones at 1.25× (the details panel shows the split). pi and opencode rows use the cost those agents
-recorded; when pi recorded none, the list price applies. Bedrock, Vertex or gateway billing differs, so treat
+recorded; when one recorded none ($0), the list price applies. Bedrock, Vertex or gateway billing differs, so treat
 it as an estimate. To price other models, create `prices.json` in the plugin's config folder,
 `herdr plugin config-dir ferretorres.agent-monitor` (usually `~/.config/herdr/plugins/config/ferretorres.agent-monitor`),
 which `herdr plugin update` leaves alone. Prices are USD per 1M tokens, and a key matches any model name that
@@ -206,8 +207,9 @@ contains it:
 {"my-gateway-model": {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "ctx": 258400}}
 ```
 
-The longest matching key wins. Missing cache prices default to 0.1× (read), 1.25× (5-minute write) and 2×
-(1-hour write) the input price.
+The longest matching key wins. An entry for a built-in model only changes the keys it names; missing cache
+prices default to 0.1× (read), 1.25× (5-minute write) and 2× (1-hour write) the input price. Values that are
+not numbers are ignored.
 
 ## Limits
 
