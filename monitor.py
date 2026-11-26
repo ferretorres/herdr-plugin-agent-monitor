@@ -5,7 +5,11 @@ Data: one `herdr api snapshot` per refresh (agents, panes, workspaces) + per age
   claude -> transcript (agent_session path, or <id>.jsonl under $CLAUDE_CONFIG_DIR/projects and
             ~/.claude*/projects), plus its subagents/
   codex  -> rollout in $CODEX_HOME/sessions by session id, else the newest one with the same cwd
+  pi     -> the session file herdr reports (or <id>.jsonl under pi's sessions dir)
+  opencode -> its SQLite database, read-only, by herdr's session id or the pane's folder
   other  -> last lines of the pane's screen (`herdr agent read`, in the background); no token data
+Writes: only its own am_* sidebar tokens and a context-90% toast (publish), from the open monitor and
+from the pane.agent_status_changed hook (`monitor.py --hook`).
 Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspace) | <workspace id>.
 Crew tokens on panes order the rows: a lead (crew_role=lead), then its workers (crew_lead=<lead pane>).
 
@@ -18,7 +22,7 @@ prices.json in the plugin config folder (see config_dir) or next to this file. P
 ferretorres/herdr-plugin-space-colors when that plugin is installed.
 Run `monitor.py --once [--usage]` for a single plain-text frame.
 """
-import curses, glob, json, os, re, subprocess, sys, textwrap, threading, time
+import curses, glob, hashlib, json, os, re, sqlite3, subprocess, sys, textwrap, threading, time, urllib.parse
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,15 +35,26 @@ VIEWS = {
     "usage": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
               ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]],
 }
-# Anthropic first-party list prices, USD per 1M tokens (https://www.anthropic.com/pricing, 2026-11-03).
-# Bedrock / gateway billing differs, so COST is an estimate. Add other models in prices.json:
+# Anthropic first-party list prices, USD per 1M tokens (https://www.anthropic.com/pricing, 2026-11-26).
+# cache_write is the 5-minute cache write, cache_write_1h the 1-hour one. Bedrock / gateway billing
+# differs, so COST is an estimate. Add other models in prices.json; missing cache prices default to
+# 0.1x (read), 1.25x (5m write) and 2x (1h write) the input price:
 # {"my-gateway-model": {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "ctx": 258400}}
 PRICES = {
-    "fable-5-2": {"in": 8.0, "out": 40.0, "cache_read": 0.20, "cache_write": 10.0, "ctx": 1_000_000},
-    "opus-5-5": {"in": 4.0, "out": 20.0, "cache_read": 0.20, "cache_write": 5.0, "ctx": 1_000_000},
-    "sonnet-5-5": {"in": 2.0, "out": 10.0, "cache_read": 0.10, "cache_write": 2.5, "ctx": 1_000_000},
-    "haiku-5-5": {"in": 0.10, "out": 0.50, "cache_read": 0.01, "cache_write": 0.125, "ctx": 1_000_000},
+    "fable-5-2": {"in": 8.0, "out": 40.0, "cache_read": 0.20, "cache_write": 10.0, "cache_write_1h": 16.0,
+                  "ctx": 1_000_000},
+    "opus-5-5": {"in": 4.0, "out": 20.0, "cache_read": 0.20, "cache_write": 5.0, "cache_write_1h": 8.0,
+                 "ctx": 1_000_000},
+    "opus-4-8": {"in": 5.0, "out": 25.0, "cache_read": 0.50, "cache_write": 6.25, "cache_write_1h": 10.0,
+                 "ctx": 1_000_000},
+    "sonnet-5-5": {"in": 2.0, "out": 10.0, "cache_read": 0.10, "cache_write": 2.5, "cache_write_1h": 4.0,
+                   "ctx": 1_000_000},
+    "haiku-5-5": {"in": 0.10, "out": 0.50, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.20,
+                  "ctx": 1_000_000},
 }
+# Context % and cost bands: table colours, the sidebar row and the context toast all use these.
+CTX_WARN, CTX_BAD, CTX_NOTIFY, CTX_REARM = 50, 80, 90, 50
+COST_WARN, COST_BAD = 10, 50
 
 
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"  # plugin panes get it; GUI launches may lack PATH
@@ -108,25 +123,28 @@ _touched = set()  # paths read during this refresh; caches of the others are dro
 
 def new_lines(path):
     """(JSON objects appended to path since the last call, whole lines only; rewound).
-    rewound is True when the file was truncated or replaced, so callers restart their sums."""
+    rewound is True when the file was truncated or replaced, so callers restart their sums.
+    The objects are streamed, so a first read of a large transcript never holds it in memory;
+    the read position is saved once the caller has gone through them all."""
     _touched.add(path)
     st = os.stat(path)
     ino, off = _new.get(path, (st.st_ino, 0))
     rewound = ino != st.st_ino or st.st_size < off
-    if rewound:
-        off = 0
+    return _stream(path, st.st_ino, 0 if rewound else off), rewound
+
+
+def _stream(path, ino, off):
     with open(path, "rb") as f:
         f.seek(off)
-        data = f.read()
-    end = data.rfind(b"\n") + 1
-    _new[path] = (st.st_ino, off + end)
-    out = []
-    for line in data[:end].splitlines():
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            pass
-    return out, rewound
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # a line still being written: read it next time
+            off += len(line)
+            try:
+                yield json.loads(line)
+            except ValueError:
+                pass
+    _new[path] = (ino, off)
 
 
 def cached_tail(path, parse):
@@ -144,7 +162,7 @@ def cached_tail(path, parse):
 
 def prune_caches():
     """Forget files no agent in view used this refresh (gone agents, rotated transcripts)."""
-    for cache in (_new, _tail, _cu, _xu):
+    for cache in (_new, _tail, _cu, _xu, _pu):
         for path in [p for p in cache if p not in _touched]:
             del cache[path]
     _touched.clear()
@@ -158,7 +176,7 @@ def is_human(text):
 def describe_tool(name, inp):
     if not isinstance(inp, dict):
         return f"{name}: {one_line(str(inp), 120)}"
-    for key in ("command", "description", "file_path", "pattern", "prompt", "url", "query"):
+    for key in ("command", "description", "file_path", "path", "pattern", "prompt", "url", "query"):
         if key in inp:
             return f"{name}: {one_line(str(inp[key]), 120)}"
     return name
@@ -224,7 +242,7 @@ _cu = {}  # transcript path -> running usage
 def claude_file_usage(path):
     """Sum usage over a Claude transcript. One API reply is written as several lines with the
     same message id, so count each id once, using the last line seen for it."""
-    fresh = lambda: {"tot": [0, 0, 0, 0], "id": None, "cur": [0, 0, 0, 0], "ctx": 0, "model": ""}
+    fresh = lambda: {"tot": [0] * 5, "id": None, "cur": [0] * 5, "ctx": 0, "model": ""}
     st = _cu.setdefault(path, fresh())
     objs, rewound = new_lines(path)
     if rewound:
@@ -237,11 +255,29 @@ def claude_file_usage(path):
         if msg.get("id") != st["id"]:
             st["tot"] = [a + b for a, b in zip(st["tot"], st["cur"])]
             st["id"] = msg.get("id")
-        st["cur"] = [u.get("input_tokens", 0), u.get("cache_read_input_tokens", 0),
-                     u.get("cache_creation_input_tokens", 0), u.get("output_tokens", 0)]
-        st["ctx"] = sum(st["cur"][:3])
+        st["cur"] = claude_reply_usage(u)
+        st["ctx"] = sum(st["cur"][:4])
         st["model"] = msg.get("model") or st["model"]
     return [a + b for a, b in zip(st["tot"], st["cur"])], st["ctx"], st["model"]
+
+
+def claude_reply_usage(u):
+    """[input, cache read, 5m cache write, 1h cache write, output] of one Claude reply. Lines without
+    the cache_creation split count every write as 5m. A few replies carry zeros at the top level and
+    the real numbers in iterations[]."""
+    keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+    parts = [u]
+    if not any(u.get(k) for k in keys) and isinstance(u.get("iterations"), list):
+        parts = [i for i in u["iterations"] if isinstance(i, dict)]
+    out = [0] * 5
+    for p in parts:
+        cc = p.get("cache_creation") or {}
+        w1h = cc.get("ephemeral_1h_input_tokens") or 0
+        w5m = cc.get("ephemeral_5m_input_tokens", (p.get("cache_creation_input_tokens") or 0) - w1h) or 0
+        vals = [p.get("input_tokens") or 0, p.get("cache_read_input_tokens") or 0, max(0, w5m), w1h,
+                p.get("output_tokens") or 0]
+        out = [a + b for a, b in zip(out, vals)]
+    return out
 
 
 def claude_usage(path):
@@ -249,8 +285,8 @@ def claude_usage(path):
     subs = glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
     for p in subs:  # subagents bill tokens too, but don't use this session's context
         tot = [a + b for a, b in zip(tot, claude_file_usage(p)[0])]
-    return {"in": tot[0], "cr": tot[1], "cw": tot[2], "out": tot[3], "ctx": ctx, "model": model,
-            "window": None, "subagents": len(subs)}
+    return {"in": tot[0], "cr": tot[1], "cw": tot[2] + tot[3], "cw5m": tot[2], "cw1h": tot[3],
+            "out": tot[4], "ctx": ctx, "model": model, "window": None, "subagents": len(subs)}
 
 
 _codex_cwd = {}  # rollout path -> cwd (session_meta is the first line, never changes)
@@ -339,9 +375,215 @@ def codex_usage(path):
     t, last = info.get("total_token_usage") or {}, info.get("last_token_usage") or {}
     cached, cw = t.get("cached_input_tokens", 0), t.get("cache_write_input_tokens", 0)
     return {"in": max(0, t.get("input_tokens", 0) - cached - cw),  # codex input includes cached
-            "cr": cached, "cw": cw, "out": t.get("output_tokens", 0),
+            "cr": cached, "cw": cw, "cw5m": cw, "cw1h": 0, "out": t.get("output_tokens", 0),
             "ctx": last.get("input_tokens", 0), "model": st["model"],
             "window": info.get("model_context_window"), "subagents": 0}
+
+
+def pi_dir():
+    return os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or "~/.pi/agent")
+
+
+def pi_path(kind, value):
+    """pi's session file. herdr's pi integration reports its path; with only an id, look for
+    <sessions>/<cwd dir>/<timestamp>_<id>.jsonl. pi writes the file only after its first reply."""
+    if kind == "path":
+        return session_file(kind, value)
+    if not value:
+        return None
+    for root in filter(None, (os.environ.get("PI_CODING_AGENT_SESSION_DIR"), os.path.join(pi_dir(), "sessions"))):
+        hit = glob.glob(os.path.join(glob.escape(os.path.expanduser(root)), "*", "*_" + glob.escape(value) + ".jsonl"))
+        if hit:
+            return hit[0]
+    return None
+
+
+def pi_activity(path):
+    return cached_tail(path, _pi_activity)
+
+
+def _pi_activity(path):
+    prompt = now = ""
+    for o in tail_lines(path):
+        m = o.get("message") or {}
+        if o.get("type") != "message":
+            continue
+        content = m.get("content")
+        if m.get("role") == "user":
+            texts = [content] if isinstance(content, str) else [
+                c.get("text", "") for c in content or [] if isinstance(c, dict) and c.get("type") == "text"]
+            texts = [t for t in texts if is_human(t)]
+            if texts:
+                prompt = texts[-1]
+        elif m.get("role") == "assistant" and isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "toolCall":
+                    now = describe_tool(c.get("name", "tool"), c.get("arguments"))
+                elif c.get("type") == "text" and (c.get("text") or "").strip():
+                    now = "says: " + c["text"]
+    return prompt, now, os.path.getmtime(path)
+
+
+_pu = {}  # pi session path -> running usage
+_pi_models = {"mtime": None, "windows": {}}
+
+
+def pi_window(provider, model):
+    """Context window from pi's models-store.json, reloaded when it changes."""
+    path = os.path.join(pi_dir(), "models-store.json")
+    try:
+        mtime = os.stat(path).st_mtime_ns
+        if mtime != _pi_models["mtime"]:
+            with open(path) as f:
+                data = json.load(f)
+            _pi_models["windows"] = {(prov, m.get("id")): m.get("contextWindow")
+                                     for prov, v in data.items() if isinstance(v, dict)
+                                     for m in v.get("models") or [] if isinstance(m, dict)}
+            _pi_models["mtime"] = mtime
+    except (OSError, ValueError, AttributeError):
+        return None
+    return _pi_models["windows"].get((provider, model))
+
+
+def pi_usage(path):
+    """Totals the way pi's footer counts them: assistant replies, subagent tool results and
+    compaction / branch summary / usage entries. Context is the last valid reply, and unknown
+    after a compaction until the next reply. Cost is pi's own; 0 means it recorded none."""
+    fresh = lambda: {"tot": [0] * 4, "usd": 0.0, "ctx": None, "model": "", "provider": ""}
+    st = _pu.setdefault(path, fresh())
+    objs, rewound = new_lines(path)
+    if rewound:
+        st = _pu[path] = fresh()
+    for o in objs:
+        kind, m = o.get("type"), o.get("message") or {}
+        u = None
+        if kind == "message" and m.get("role") in ("assistant", "toolResult"):
+            u = m.get("usage")
+        elif kind in ("compaction", "branch_summary", "usage"):
+            u = o.get("usage")
+        if kind == "compaction":
+            st["ctx"] = None
+        if not isinstance(u, dict):
+            continue
+        vals = [u.get("input") or 0, u.get("cacheRead") or 0, u.get("cacheWrite") or 0, u.get("output") or 0]
+        st["tot"] = [a + b for a, b in zip(st["tot"], vals)]
+        st["usd"] += ((u.get("cost") or {}).get("total") or 0) if isinstance(u.get("cost"), dict) else 0
+        if kind == "message" and m.get("role") == "assistant" and m.get("stopReason") not in ("aborted", "error"):
+            ctx = u.get("totalTokens") or sum(vals)
+            if ctx:
+                st["ctx"], st["model"], st["provider"] = ctx, m.get("model") or st["model"], m.get("provider") or ""
+    t = st["tot"]
+    return {"in": t[0], "cr": t[1], "cw": t[2], "out": t[3], "ctx": st["ctx"] or 0, "model": st["model"],
+            "window": pi_window(st["provider"], st["model"]), "subagents": 0,
+            "usd": st["usd"] or None, "usd_src": "pi" if st["usd"] else None}
+
+
+def opencode_db():
+    data = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "opencode")
+    p = os.environ.get("OPENCODE_DB")
+    return os.path.join(data, os.path.expanduser(p)) if p else os.path.join(data, "opencode.db")
+
+
+_oc_models = {"mtime": None, "windows": {}}
+
+
+def opencode_window(provider, model):
+    """Context window from opencode's models.dev cache, reloaded when it changes."""
+    path = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "opencode", "models.json")
+    try:
+        mtime = os.stat(path).st_mtime_ns
+        if mtime != _oc_models["mtime"]:
+            with open(path) as f:
+                data = json.load(f)
+            _oc_models["windows"] = {(prov, mid): ((m.get("limit") or {}).get("context"))
+                                     for prov, v in data.items() if isinstance(v, dict)
+                                     for mid, m in (v.get("models") or {}).items() if isinstance(m, dict)}
+            _oc_models["mtime"] = mtime
+    except (OSError, ValueError, AttributeError):
+        return None
+    return _oc_models["windows"].get((provider, model))
+
+
+OC_TREE = "with recursive t(id) as (select ? union all select s.id from session s join t on s.parent_id = t.id)"
+
+
+def opencode_read(a):
+    """(prompt, now, ts, usage) for an opencode agent from opencode's SQLite database, or None
+    (no database, an unknown schema, no session): the row then falls back to the screen.
+    Opened read-only and closed at once, so opencode's WAL checkpoints are never held up."""
+    path = opencode_db()
+    if not os.path.isfile(path):
+        return None
+    s = a.get("agent_session") or {}
+    try:
+        c = sqlite3.connect(f"file:{urllib.parse.quote(path)}?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error:
+        return None
+    try:
+        tables = {n for (n,) in c.execute("select name from sqlite_master where type = 'table'")}
+        if not {"session", "message", "part"} <= tables:
+            return None  # e.g. the session_v2 schema of newer opencode releases
+        sid = s.get("value") if s.get("kind") == "id" and str(s.get("value", "")).startswith("ses_") else None
+        if not sid and a.get("cwd"):
+            # ponytail: without herdr's session id, the newest root session in this folder;
+            # two opencode agents in one folder would show the same session.
+            r = c.execute("select id from session where directory = ? and parent_id is null"
+                          " and time_archived is null order by time_updated desc limit 1", (a["cwd"],)).fetchone()
+            sid = r and r[0]
+        if not sid:
+            return None
+        head = c.execute("select time_updated from session where id = ?", (sid,)).fetchone()
+        if not head:
+            return None
+        n, usd, tin, tout, tcr, tcw = c.execute(
+            OC_TREE + " select count(*) - 1, sum(cost), sum(tokens_input), sum(tokens_output + tokens_reasoning),"
+            " sum(tokens_cache_read), sum(tokens_cache_write) from session where id in (select id from t)",
+            (sid,)).fetchone()
+        last = c.execute("select json_extract(data, '$.tokens'), json_extract(data, '$.providerID'),"
+                         " json_extract(data, '$.modelID') from message where session_id = ?"
+                         " and json_extract(data, '$.role') = 'assistant' and json_extract(data, '$.tokens.output') > 0"
+                         " order by time_created desc limit 1", (sid,)).fetchone()
+        prompt = c.execute("select json_extract(p.data, '$.text') from part p join message m on m.id = p.message_id"
+                           " where m.session_id = ? and json_extract(m.data, '$.role') = 'user'"
+                           " and json_extract(p.data, '$.type') = 'text'"
+                           " and coalesce(json_extract(p.data, '$.synthetic'), 0) = 0"
+                           " order by m.time_created desc, p.id desc limit 1", (sid,)).fetchone()
+        part = c.execute("select data from part where session_id = ? and json_extract(data, '$.type') in ('tool', 'text')"
+                         " order by time_created desc, id desc limit 1", (sid,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        c.close()
+    ctx, provider, model = 0, "", ""
+    if last:
+        try:
+            t = json.loads(last[0] or "{}")
+            cache = t.get("cache") or {}
+            ctx = sum(t.get(k) or 0 for k in ("input", "output", "reasoning")) + (cache.get("read") or 0) \
+                + (cache.get("write") or 0)
+        except (ValueError, AttributeError):
+            pass
+        provider, model = last[1] or "", last[2] or ""
+    now = ""
+    if part:
+        try:
+            p = json.loads(part[0])
+        except ValueError:
+            p = {}
+        if p.get("type") == "tool":
+            st = p.get("state") or {}
+            now = describe_tool(p.get("tool", "tool"), st.get("input"))
+            if st.get("status") in ("pending", "running"):
+                now += f" ({st['status']})"
+        elif (p.get("text") or "").strip():
+            now = "says: " + p["text"]
+    text = prompt[0] if prompt and is_human(prompt[0]) else ""
+    usage = {"in": tin or 0, "cr": tcr or 0, "cw": tcw or 0, "out": tout or 0, "ctx": ctx, "model": model,
+             "window": opencode_window(provider, model), "subagents": n or 0,
+             "usd": usd or None, "usd_src": "opencode" if usd else None}
+    return text, now, (head[0] or 0) / 1000 or None, usage
 
 
 def screen_activity(pane_id):
@@ -422,14 +664,21 @@ def load_prices():
 
 
 def price_for(model, prices):
-    return next((p for key, p in prices.items() if key in (model or "")), None)
+    """The price whose key is the longest part of the model name (opus-4-8 over opus-4)."""
+    key = max((k for k in prices if k and k in (model or "")), key=len, default=None)
+    return prices[key] if key else None
 
 
 def cost(u, price):
-    if not price:
+    """USD at list price. 5m and 1h cache writes are priced apart; a usage without the split
+    (or a price without the cache keys) falls back to the multiples of the input price."""
+    if not price or "in" not in price or "out" not in price:
         return None
-    return (u["in"] * price["in"] + u["cr"] * price["cache_read"] + u["cw"] * price["cache_write"]
-            + u["out"] * price["out"]) / 1e6
+    i = price["in"]
+    read = price.get("cache_read", 0.1 * i)
+    w5, w1 = price.get("cache_write", 1.25 * i), price.get("cache_write_1h", 2 * i)
+    cw5m, cw1h = u.get("cw5m", u.get("cw", 0)), u.get("cw1h", 0)
+    return (u["in"] * i + u["cr"] * read + cw5m * w5 + cw1h * w1 + u["out"] * price["out"]) / 1e6
 
 
 def num(n):
@@ -519,6 +768,8 @@ def transcript(a):
         return claude_path(s.get("kind"), s.get("value"))
     if a["agent"] == "codex":
         return codex_path(a.get("cwd"), s.get("kind"), s.get("value"))
+    if a["agent"] == "pi":
+        return pi_path(s.get("kind"), s.get("value"))
     return None
 
 
@@ -531,16 +782,22 @@ def agent_entry(a):
                 agent_status=a.get("agent_status") or "unknown")
 
 
-def build_rows(snap, ws=None, wait=False):
+def build_rows(snap, ws=None, wait=False, screens=True):
     agents = [e for e in map(agent_entry, snap.get("agents") or [])
               if e and (ws is None or e.get("workspace_id") == ws)]
     found = {a["pane_id"]: transcript(a) for a in agents}
-    screens = {a["pane_id"]: screen_start(a) for a in agents if not found[a["pane_id"]]}
-    if wait:
-        screen_wait(screens.values())
-    screen_prune(screens)
+    oc = {a["pane_id"]: opencode_read(a) for a in agents if a["agent"] == "opencode"}
+    want_screen = [a for a in agents if not found[a["pane_id"]] and not oc.get(a["pane_id"])]
+    if screens:
+        screens = {a["pane_id"]: screen_start(a) for a in want_screen}
+        if wait:
+            screen_wait(screens.values())
+        screen_prune(screens)
+    else:  # the hook: no screen reads, these rows only feed the sidebar and the toast
+        screens = {a["pane_id"]: {"value": ("", "", None)} for a in want_screen}
     panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
     spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
+    tabs = {t.get("tab_id"): t for t in snap.get("tabs") or []}
     prices = load_prices()
     rows = []
     for a in agents:
@@ -548,14 +805,21 @@ def build_rows(snap, ws=None, wait=False):
         if path and a["agent"] == "claude":
             prompt, now, ts = claude_activity(path)
             usage = claude_usage(path)
+        elif path and a["agent"] == "pi":
+            prompt, now, ts = pi_activity(path)
+            usage = pi_usage(path)
         elif path:
             prompt, now, ts = codex_activity(path)
             usage = codex_usage(path)
+        elif oc.get(a["pane_id"]):
+            prompt, now, ts, usage = oc[a["pane_id"]]
         else:
             prompt, now, ts = screens[a["pane_id"]]["value"]
         price = price_for(usage and usage["model"], prices)
         window = (usage or {}).get("window") or (price or {}).get("ctx")
-        usd = cost(usage, price) if usage else None
+        # Agents that record their own cost (pi, opencode) use it; the rest are list-priced here.
+        usd = (usage.get("usd") or cost(usage, price)) if usage else None
+        usd_src = (usage.get("usd_src") if usage.get("usd") else "list") if usage and usd is not None else None
         pct = 100 * usage["ctx"] / window if usage and window and usage["ctx"] else None
         u = usage or {}
         goal = a.get("title") or a.get("terminal_title_stripped") or ""  # title: report-metadata --title
@@ -566,7 +830,11 @@ def build_rows(snap, ws=None, wait=False):
         rows.append({
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
             "space": palette, "parent": lead if role == "worker" else None,
-            "pct": pct, "usd": usd, "usage": usage,
+            "pct": pct, "usd": usd, "usd_src": usd_src, "usage": usage,
+            "tokens": tokens, "labels": a.get("state_labels") or {},
+            "session": path or (a.get("agent_session") or {}).get("value") or "",
+            "place": " · ".join(x for x in ((spaces.get(a.get("workspace_id")) or {}).get("label"),
+                                            (tabs.get(a.get("tab_id")) or {}).get("label"), a["pane_id"]) if x),
             "cells": {
                 "ST": GLYPH.get(a["agent_status"], "?"), "PANE": a["pane_id"], "AGENT": a.get("name") or a["agent"],
                 "AGE": ago(ts), "GOAL": one_line(goal), "LAST PROMPT": one_line(prompt), "NOW": one_line(now),
@@ -577,7 +845,7 @@ def build_rows(snap, ws=None, wait=False):
                 "COST": f"${usd:.2f}" if usd is not None else ("?" if usage else ""),
             },
             "full": [("GOAL", goal), ("LAST PROMPT", prompt or ""), ("NOW", now or ""),
-                     ("USAGE", usage_text(usage, window, usd)),
+                     ("USAGE", usage_text(usage, window, usd, usd_src)),
                      ("WHERE", f'{a["pane_id"]} · {a.get("cwd", "")}' + (f" · {path}" if path else ""))]
                     + ([("CREW", " · ".join(x for x in (crew, role, lead and f"lead {lead}") if x))]
                        if role or crew else []),
@@ -625,13 +893,23 @@ def fit_cols(cols, rows, cap=24):
     return [[n, min(max(wd, need), cap) if n == "PANE" and wd > 0 else wd] for n, wd in cols]
 
 
-def usage_text(u, window, usd):
+COST_SOURCE = {"list": "at list price", "pi": "as recorded by pi",
+               "opencode": "as estimated by opencode (models.dev prices)"}
+
+
+def usage_text(u, window, usd, src="list"):
     if not u:
-        return "no token data for this agent (only Claude and Codex logs are read)"
+        return "no token data for this agent (Claude Code, Codex, pi and opencode sessions are read)"
     ctx = f"context {u['ctx']:,}" + (f" of {window:,} ({100 * u['ctx'] / window:.0f}%)" if window else "")
-    money = f"≈ ${usd:.2f} at list price" if usd is not None else f"no price for {u['model']!r} (add it to prices.json)"
-    subs = f" · includes {u['subagents']} subagent transcripts" if u["subagents"] else ""
-    return (f"{u['model']} · {ctx}\ninput {u['in']:,} · cache read {u['cr']:,} · cache write {u['cw']:,}"
+    if usd is None:
+        money = f"no price for {u['model']!r} (add it to prices.json)"
+    else:
+        money = f"≈ ${usd:.2f} {COST_SOURCE.get(src, 'at list price')}"
+        if u.get("cw1h"):
+            money += " (cache writes: 1h at 2× input, 5m at 1.25×)"
+    split = f" (1h {u['cw1h']:,} · 5m {u.get('cw5m', 0):,})" if u.get("cw1h") else ""
+    subs = f" · includes {u['subagents']} subagent sessions" if u["subagents"] else ""
+    return (f"{u['model']} · {ctx}\ninput {u['in']:,} · cache read {u['cr']:,} · cache write {u['cw']:,}{split}"
             f" · output {u['out']:,}{subs}\n{money}")
 
 
@@ -640,8 +918,10 @@ def totals(rows):
     t = {k: sum(u[k] for u in us) for k in ("in", "cr", "cw", "out")}
     usd = sum(r["usd"] for r in rows if r["usd"] is not None)
     unpriced = sum(1 for r in rows if r["usage"] and r["usd"] is None)
+    srcs = {r.get("usd_src") for r in rows if r["usd"] is not None}
+    label = "list price" if srcs <= {"list"} else "agent-reported" if "list" not in srcs else "list price + agent-reported"
     return (f"Σ in {num(t['in']) or 0} · cache r {num(t['cr']) or 0} · cache w {num(t['cw']) or 0}"
-            f" · out {num(t['out']) or 0} · ≈ ${usd:.2f} list price" + (f" (+{unpriced} unpriced)" if unpriced else ""))
+            f" · out {num(t['out']) or 0} · ≈ ${usd:.2f} {label}" + (f" (+{unpriced} unpriced)" if unpriced else ""))
 
 
 def fit(text, w):
@@ -779,9 +1059,9 @@ def cell_attr(C, row, name):
         text = row["cells"][name]
         return C["says"] if text.startswith("says:") else C["screen"] if text.startswith("screen:") else C["tool"]
     if name in ("CTX", "CTX%") and row["pct"] is not None:  # how close to a full context window
-        return C["bad"] if row["pct"] >= 80 else C["warn"] if row["pct"] >= 50 else C["ok"]
+        return C["bad"] if row["pct"] >= CTX_BAD else C["warn"] if row["pct"] >= CTX_WARN else C["ok"]
     if name == "COST" and row["usd"] is not None:
-        return C["bad"] if row["usd"] >= 50 else C["warn"] if row["usd"] >= 10 else 0
+        return C["bad"] if row["usd"] >= COST_BAD else C["warn"] if row["usd"] >= COST_WARN else 0
     if row["status"] == "idle" and name != "GOAL":
         return C["dim"]
     return 0
@@ -804,6 +1084,166 @@ def draw_detail(scr, row, top, h, w, C):
                 y += 1
 
 
+# --- Sidebar row and context toast ---------------------------------------------------------------
+# The monitor writes only its own am_* pane tokens (source ferretorres.agent-monitor), never state
+# labels, titles or other plugins' keys: the crew plugin owns the labels and rewrites them.
+SIDEBAR_KEYS = ("am_bad", "am_warn", "am_ok")
+PAD = "\u2800"  # herdr trims leading spaces in sidebar rows, not this blank
+
+
+def sidebar_band(row):
+    """am_bad / am_warn / am_ok for a row's context % and cost, or None without numbers."""
+    pct, usd = row.get("pct"), row.get("usd")
+    if pct is None and usd is None:
+        return None
+    if (pct or 0) >= CTX_BAD or (usd or 0) >= COST_BAD:
+        return "am_bad"
+    if (pct or 0) >= CTX_WARN or (usd or 0) >= COST_WARN:
+        return "am_warn"
+    return "am_ok"
+
+
+def money_short(usd):
+    return f"${usd:.1f}" if usd < 10 else f"${usd:.0f}"
+
+
+def sidebar_value(row):
+    """The numbers, indented 2 past the agent line's own indent (the crew plugin's labels start
+    with U+2800 blanks), so the row sits under the agent's name."""
+    label = next((v for v in (row.get("labels") or {}).values() if v), "")
+    indent = len(label) - len(label.lstrip(PAD))
+    parts = ([f"{row['pct']:.0f}%"] if row.get("pct") is not None else []) + \
+            ([money_short(row["usd"])] if row.get("usd") is not None else [])
+    return PAD * (indent + 2) + " ".join(parts)
+
+
+def sidebar_want(row, mode):
+    """{key: value} of am_* tokens this pane should carry: one key at most, none below warn."""
+    if mode == "off":
+        return {}
+    band = sidebar_band(row)
+    if band is None or (band == "am_ok" and mode != "all"):
+        return {}
+    return {band: sidebar_value(row)}
+
+
+def metadata_args(pane, set_tokens, clear):
+    """The report-metadata call. Refuses any key outside the monitor's own am_* prefix."""
+    keys = list(set_tokens) + list(clear)
+    if any(not k.startswith("am_") for k in keys):
+        raise ValueError(f"refusing to write tokens outside am_*: {keys}")
+    args = ["pane", "report-metadata", pane, "--source", PLUGIN_ID]
+    for k, v in set_tokens.items():
+        args += ["--token", f"{k}={v}"]
+    for k in clear:
+        args += ["--clear-token", k]
+    return args
+
+
+def sidebar_update(row, mode):
+    """report-metadata args to bring the pane's live am_* tokens to what they should be, or None."""
+    want = sidebar_want(row, mode)
+    have = {k: v for k, v in (row.get("tokens") or {}).items() if k in SIDEBAR_KEYS}
+    set_tokens = {k: v for k, v in want.items() if have.get(k) != v}
+    clear = [k for k in have if k not in want]
+    return metadata_args(row["pane"], set_tokens, clear) if set_tokens or clear else None
+
+
+def toast_marker(row):
+    key = hashlib.sha256(f"{row['pane']}\0{row.get('session', '')}".encode()).hexdigest()[:16]
+    return os.path.join(state_dir(), "sent", f"{key}-ctx{CTX_NOTIFY}")
+
+
+def toast_due(row):
+    """Claim the context toast for this pane's session, once: the process that creates the
+    marker sends it, so the open monitor and the hook never both do. Below CTX_REARM the claim
+    is dropped and the next crossing toasts again. True = send now."""
+    pct, marker = row.get("pct"), toast_marker(row)
+    if pct is None or pct < CTX_REARM:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        return False
+    if pct < CTX_NOTIFY:
+        return False
+    try:
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
+def send_toast(row):
+    name = row["cells"].get("AGENT") or row["agent"]
+    try:
+        out = herdr_json("notification", "show", f"{name} context {row['pct']:.0f}%", "--body", row.get("place") or row["pane"],
+                         "--sound", "none")
+    except (HerdrError, subprocess.TimeoutExpired):
+        out = {"reason": "busy"}
+    if not out.get("shown") and out.get("reason") in ("rate_limited", "busy"):
+        try:
+            os.unlink(toast_marker(row))  # try again on the next refresh or status change
+        except OSError:
+            pass
+
+
+def prune_markers(days=7):
+    folder = os.path.join(state_dir(), "sent")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    old = time.time() - days * 86400
+    for n in names:
+        p = os.path.join(folder, n)
+        try:
+            if os.path.getmtime(p) < old:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def publish(rows):
+    """Write the sidebar row tokens that changed and send due context toasts. Called by the
+    open monitor after each refresh and by the pane.agent_status_changed hook."""
+    mode = (os.environ.get("AGENT_MONITOR_SIDEBAR") or "warn").strip()
+    notify = (os.environ.get("AGENT_MONITOR_NOTIFY") or "1").strip() != "0"
+    for row in rows:
+        args = sidebar_update(row, mode)
+        if args:
+            try:
+                herdr(*args)
+            except (HerdrError, subprocess.TimeoutExpired):
+                pass  # the pane may have closed; the next refresh retries
+        if notify and toast_due(row):
+            send_toast(row)
+    prune_markers()
+
+
+def hook():
+    """pane.agent_status_changed: refresh that one pane's sidebar row and toast, with no monitor
+    pane open. herdr runs one process per event."""
+    try:
+        ev = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
+    except ValueError:
+        ev = {}
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else ev
+    pane = data.get("pane_id") or (data.get("pane") or {}).get("pane_id") or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return 0
+    try:
+        snap = snapshot()
+    except (HerdrError, subprocess.TimeoutExpired):
+        return 1
+    snap = dict(snap, agents=[a for a in snap.get("agents") or [] if isinstance(a, dict) and a.get("pane_id") == pane])
+    publish(build_rows(snap, wait=False, screens=False))
+    return 0
+
+
 def refresh_forever(state, every=2.0):
     """Background thread: collect() off the UI thread, so a slow herdr never freezes keys or mouse.
     The UI only reads state["data"]; one assignment of a tuple, so no lock is needed."""
@@ -819,6 +1259,7 @@ def refresh_once(state):
     try:
         rows, state["scope"] = collect()
         state["data"] = (rows, "")
+        publish(rows)
     except subprocess.TimeoutExpired as e:  # keep the last rows until herdr answers again
         state["data"] = (state["data"][0], f" ⚠ herdr did not answer: {' '.join(e.cmd[1:3])} ·")
     except HerdrError as e:  # e.g. server_not_running: say so instead of showing 0 agents
@@ -828,7 +1269,11 @@ def refresh_once(state):
 
 
 def draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w):
-    scr.addnstr(0, 0, f" agent monitor · {state['scope']} · {len(rows)} agents", w - 1, curses.A_BOLD)
+    title = f" agent monitor · {state['scope']} · {len(rows)} agents"
+    scr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
+    full = sum(1 for r in rows if r["pct"] is not None and r["pct"] >= CTX_NOTIFY)
+    if full and len(title) < w - 1:
+        scr.addnstr(0, len(title), f" · {full} context ≥{CTX_NOTIFY}%", w - 1 - len(title), C["warn"] | curses.A_BOLD)
     for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
         if x < w - 1:
             attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
@@ -996,7 +1441,8 @@ def once(argv):
     except HerdrError as e:
         print(f"⚠ herdr: {e}", file=sys.stderr)
         return 1
-    print(f"agent monitor · {scope} · {len(rows)} agents"[:width])
+    full = sum(1 for r in rows if r["pct"] is not None and r["pct"] >= CTX_NOTIFY)
+    print((f"agent monitor · {scope} · {len(rows)} agents" + (f" · {full} context ≥{CTX_NOTIFY}%" if full else ""))[:width])
     print("\n".join(frame(rows, VIEWS[view], width)))
     if view == "usage":
         print(totals(rows))
@@ -1006,6 +1452,8 @@ def once(argv):
 if __name__ == "__main__":
     if "--open-workspace" in sys.argv:  # the "Agent monitor (this workspace)" action
         sys.exit(open_workspace())
+    if "--hook" in sys.argv:  # pane.agent_status_changed: sidebar row and context toast
+        sys.exit(hook())
     if "--once" in sys.argv:
         sys.exit(once(sys.argv))
     else:

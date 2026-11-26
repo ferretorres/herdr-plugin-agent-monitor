@@ -1,6 +1,6 @@
 id = "ferretorres.agent-monitor"
 name = "agent-monitor"
-version = "0.3.0"
+version = "0.4.0"
 description = "What the agents on this herdr server are doing and using: goal, last prompt, current action, context, tokens, cost"
 min_herdr_version = "0.9.5"
 platforms = ["linux", "macos"]
@@ -26,3 +26,9 @@ title = "Agent monitor (this workspace)"
 description = "Only the agents in this workspace, leads first with their workers"
 command = ["python3", "monitor.py", "--open-workspace"]
 contexts = ["workspace"]
+
+# Keeps the optional sidebar row (am_* tokens) and the context-90% toast current while no monitor
+# pane is open. One short process per agent status change.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "monitor.py", "--hook"]

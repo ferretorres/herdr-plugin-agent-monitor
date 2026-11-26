@@ -24,7 +24,16 @@ u = lambda i, cr, cw, o: {"input_tokens": i, "cache_read_input_tokens": cr, "cac
 a = lambda mid, us: {"type": "assistant", "message": {"id": mid, "model": "claude-opus-5-5", "usage": us}}
 p = jsonl([a("m1", u(10, 100, 50, 5)), a("m1", u(10, 100, 50, 7)), a("m2", u(2, 160, 0, 3))], partial='{"type": "assi')
 tot, ctx, model = claude_file_usage(p)
-assert tot == [12, 260, 50, 10] and ctx == 162 and model == "claude-opus-5-5", (tot, ctx)
+assert tot == [12, 260, 50, 0, 10] and ctx == 162 and model == "claude-opus-5-5", (tot, ctx)
+
+# 1h and 5m cache writes are kept apart; zeroed replies take their numbers from iterations[].
+from monitor import claude_reply_usage
+assert claude_reply_usage({"input_tokens": 5, "cache_creation_input_tokens": 30, "output_tokens": 2,
+                           "cache_creation": {"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 20}}) \
+    == [5, 0, 10, 20, 2]
+assert claude_reply_usage({"input_tokens": 1, "cache_creation_input_tokens": 7}) == [1, 0, 7, 0, 0]
+assert claude_reply_usage({"input_tokens": 0, "output_tokens": 0, "iterations": [
+    {"input_tokens": 3, "output_tokens": 4}, {"input_tokens": 1, "cache_read_input_tokens": 9}]}) == [4, 9, 0, 0, 4]
 
 # Codex: input_tokens includes cached + cache writes, so uncached input is the remainder.
 info = {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 700, "cache_write_input_tokens": 100, "output_tokens": 50},
@@ -35,6 +44,14 @@ assert (x["in"], x["cr"], x["cw"], x["out"], x["ctx"], x["window"], x["model"]) 
 
 # 1M uncached input + 1M output on Opus 5.5 = $4 + $20.
 assert cost({"in": 1e6, "cr": 0, "cw": 0, "out": 1e6}, price_for("claude-opus-5-5", PRICES)) == 24.0
+# 1M of each: input 4 + cache read 0.20 + 5m write 5 + 1h write 8 + output 20.
+assert round(cost({"in": 1e6, "cr": 1e6, "cw": 2e6, "cw5m": 1e6, "cw1h": 1e6, "out": 1e6},
+                  price_for("claude-opus-5-5", PRICES)), 6) == 37.2
+# A prices.json entry with only in/out gets the default cache multiples instead of failing.
+assert round(cost({"in": 0, "cr": 1e6, "cw": 1e6, "out": 0}, {"in": 2, "out": 8}), 6) == 0.2 + 2.5
+assert cost({"in": 1, "cr": 0, "cw": 0, "out": 1}, {"in": 2}) is None
+# The longest matching key wins.
+assert price_for("claude-opus-4-8", dict(PRICES, **{"opus-4": {"in": 99, "out": 99}}))["in"] == 5.0
 assert price_for("gpt-x", PRICES) is None
 print("ok")
 
@@ -224,13 +241,13 @@ print("ok")
 
 # --- caches: truncation, stat-keyed tails, pruning -------------------------------------------------
 t = jsonl([a("m1", u(10, 0, 0, 5)), a("m2", u(20, 0, 0, 5))])
-assert monitor.claude_file_usage(t)[0] == [30, 0, 0, 10]
+assert monitor.claude_file_usage(t)[0] == [30, 0, 0, 0, 10]
 with open(t, "w") as f:                       # rewritten shorter: start over, don't stall at the old offset
     f.write(json.dumps(a("m9", u(1, 0, 0, 1))) + "\n")
-assert monitor.claude_file_usage(t)[0] == [1, 0, 0, 1]
+assert monitor.claude_file_usage(t)[0] == [1, 0, 0, 0, 1]
 with open(t, "a") as f:
     f.write(json.dumps(a("m10", u(2, 0, 0, 2))) + "\n")
-assert monitor.claude_file_usage(t)[0] == [3, 0, 0, 3]
+assert monitor.claude_file_usage(t)[0] == [3, 0, 0, 0, 3]
 
 parsed = []
 probe = lambda path: parsed.append(path) or len(parsed)
@@ -400,4 +417,132 @@ del os.environ["HERDR_PLUGIN_CONFIG_DIR"]
 os.environ["XDG_CONFIG_HOME"] = os.path.join(cfg, "xdg")
 assert monitor.config_dir() == os.path.join(cfg, "xdg", "herdr", "plugins", "config", "ferretorres.agent-monitor")
 del os.environ["XDG_CONFIG_HOME"]
+print("ok")
+
+# --- pi sessions -----------------------------------------------------------------------------------
+pu = lambda i, cr, cw, o, usd=0.0: {"input": i, "cacheRead": cr, "cacheWrite": cw, "output": o,
+                                     "totalTokens": i + cr + cw + o, "cost": {"total": usd}}
+pi_file = jsonl([
+    {"type": "session", "version": 3, "id": "s1", "cwd": "/w"},
+    {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "document the API"}]}},
+    {"type": "message", "message": {"role": "assistant", "model": "gpt-x", "provider": "prov", "stopReason": "toolUse",
+                                    "usage": pu(100, 1000, 0, 50, 0.25),
+                                    "content": [{"type": "toolCall", "name": "read", "arguments": {"path": "docs/api.md"}}]}},
+    {"type": "message", "message": {"role": "toolResult", "toolName": "subagent", "usage": pu(10, 0, 0, 5, 0.05)}},
+])
+monitor._pu.clear()
+x = monitor.pi_usage(pi_file)
+assert (x["in"], x["cr"], x["out"], x["ctx"], x["model"]) == (110, 1000, 55, 1150, "gpt-x"), x
+assert round(x["usd"], 6) == 0.30 and x["usd_src"] == "pi"
+assert monitor.pi_activity(pi_file)[:2] == ("document the API", "read: docs/api.md")
+with open(pi_file, "a") as f:  # after a compaction the context is unknown until the next reply
+    f.write(json.dumps({"type": "compaction", "usage": pu(5, 0, 0, 5)}) + "\n")
+assert monitor.pi_usage(pi_file)["ctx"] == 0 and monitor.pi_usage(pi_file)["in"] == 115
+with open(pi_file, "a") as f:
+    f.write(json.dumps({"type": "message", "message": {"role": "assistant", "model": "gpt-x", "stopReason": "stop",
+                                                       "usage": pu(1, 2, 0, 3)}}) + "\n")
+assert monitor.pi_usage(pi_file)["ctx"] == 6
+monitor._pu.clear()
+assert monitor.pi_usage(jsonl([{"type": "message", "message": {"role": "assistant", "usage": pu(1, 0, 0, 1)}}]))["usd"] is None
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, "sessions", "--w--"))
+open(os.path.join(d, "sessions", "--w--", "2026-01-01T00-00-00-000Z_abc.jsonl"), "w").close()
+os.environ["PI_CODING_AGENT_DIR"] = d
+assert monitor.pi_path("id", "abc").endswith("_abc.jsonl") and monitor.pi_path("path", "/nope.jsonl") is None
+del os.environ["PI_CODING_AGENT_DIR"]
+print("ok")
+
+# --- opencode database ---------------------------------------------------------------------------
+import sqlite3
+oc_home = tempfile.mkdtemp()
+os.makedirs(os.path.join(oc_home, "opencode"))
+db = os.path.join(oc_home, "opencode", "opencode.db")
+w = sqlite3.connect(db)
+w.execute("pragma journal_mode=wal")
+w.execute("create table session (id text primary key, parent_id text, directory text, cost real, tokens_input int,"
+          " tokens_output int, tokens_reasoning int, tokens_cache_read int, tokens_cache_write int,"
+          " time_created int, time_updated int, time_archived int)")
+w.execute("create table message (id text primary key, session_id text, time_created int, time_updated int, data text)")
+w.execute("create table part (id text primary key, message_id text, session_id text, time_created int,"
+          " time_updated int, data text)")
+S = "insert into session values (?,?,?,?,?,?,?,?,?,?,?,null)"
+w.execute(S, ("ses_A", None, "/x", 1.5, 100, 50, 10, 1000, 200, 1, 2000))
+w.execute(S, ("ses_B", "ses_A", "/x", 0.5, 10, 5, 0, 100, 20, 1, 1500))
+w.execute("insert into message values ('msg_1','ses_A',1,1,?)", (json.dumps({"role": "user"}),))
+w.execute("insert into message values ('msg_2','ses_A',2,2,?)", (json.dumps(
+    {"role": "assistant", "providerID": "anthropic", "modelID": "claude-opus-4-7",
+     "tokens": {"input": 5, "output": 7, "reasoning": 1, "cache": {"read": 900, "write": 10}}}),))
+w.execute("insert into part values ('prt_1','msg_1','ses_A',1,1,?)", (json.dumps({"type": "text", "text": "fix the bug"}),))
+w.execute("insert into part values ('prt_0','msg_1','ses_A',1,1,?)",
+          (json.dumps({"type": "text", "text": "<ctx>", "synthetic": True}),))
+w.execute("insert into part values ('prt_2','msg_2','ses_A',3,3,?)", (json.dumps(
+    {"type": "tool", "tool": "bash", "state": {"status": "running", "input": {"command": "ls"}}}),))
+w.commit()  # the writer stays open, as opencode's does
+os.environ["XDG_DATA_HOME"] = oc_home
+oc_agent = {"pane_id": "w1:p9", "agent": "opencode", "cwd": "/x", "agent_session": {"kind": "id", "value": "ses_A"}}
+prompt, now, ts, u = monitor.opencode_read(oc_agent)
+assert (prompt, now, ts) == ("fix the bug", "bash: ls (running)", 2.0), (prompt, now, ts)
+assert (u["in"], u["out"], u["cr"], u["cw"], u["ctx"], u["subagents"], u["usd"]) == (110, 65, 1100, 220, 923, 1, 2.0), u
+assert monitor.opencode_read(dict(oc_agent, agent_session={}))[3]["in"] == 110      # found by folder
+assert monitor.opencode_read(dict(oc_agent, cwd="/y", agent_session={})) is None
+w.execute("alter table session rename to session_v2")
+w.commit()
+assert monitor.opencode_read(oc_agent) is None                                       # unknown schema: screen
+del os.environ["XDG_DATA_HOME"]
+w.close()
+print("ok")
+
+# --- sidebar row ---------------------------------------------------------------------------------
+from monitor import sidebar_band, sidebar_update, metadata_args, PAD
+assert sidebar_band({"pct": 49, "usd": 9}) == "am_ok" and sidebar_band({"pct": None, "usd": None}) is None
+assert sidebar_band({"pct": 50, "usd": 0}) == "am_warn" and sidebar_band({"pct": 12, "usd": 55}) == "am_bad"
+assert sidebar_band({"pct": None, "usd": 17}) == "am_warn"
+row = {"pane": "w1:p1", "pct": 91.2, "usd": 159.3, "tokens": {"crew_role": "lead"},
+       "labels": {"idle": PAD * 2 + "○ ★ lead · claude"}}
+args = sidebar_update(row, "warn")
+assert args == ["pane", "report-metadata", "w1:p1", "--source", "ferretorres.agent-monitor",
+                "--token", "am_bad=" + PAD * 4 + "91% $159"], args
+assert sidebar_update(dict(row, tokens={"am_bad": PAD * 4 + "91% $159"}), "warn") is None    # unchanged: no write
+moved = sidebar_update(dict(row, pct=55, usd=3.4, tokens={"am_bad": "x"}), "warn")
+assert moved[-4:] == ["--token", "am_warn=" + PAD * 4 + "55% $3.4", "--clear-token", "am_bad"], moved
+assert sidebar_update(dict(row, pct=10, usd=1, tokens={"am_warn": "x"}), "warn")[-2:] == ["--clear-token", "am_warn"]
+assert sidebar_update(dict(row, pct=10, usd=1, tokens={}), "all")[-1] == "am_ok=" + PAD * 4 + "10% $1.0"
+assert sidebar_update(dict(row, tokens={"am_bad": "x"}), "off")[-2:] == ["--clear-token", "am_bad"]
+assert sidebar_update(dict(row, labels={}), "warn")[-1] == "am_bad=" + PAD * 2 + "91% $159"
+for bad in ({"crew_role": "x"}, {"sc_blue": "x"}):
+    try:
+        metadata_args("w1:p1", bad, [])
+        raise AssertionError("wrote a foreign key")
+    except ValueError:
+        pass
+assert not any(f in sidebar_update(row, "warn") for f in ("--state-label", "--title", "--display-agent"))
+print("ok")
+
+# --- context toast ---------------------------------------------------------------------------------
+os.environ["HERDR_PLUGIN_STATE_DIR"] = tempfile.mkdtemp()
+sent = []
+monitor.herdr_json = lambda *a: (sent.append(a), {"shown": True})[1]
+r = {"pane": "w1:p1", "agent": "claude", "session": "/t.jsonl", "place": "billing · main · w1:p1",
+     "cells": {"AGENT": "lead"}, "pct": 91.0, "usd": None, "tokens": {}, "labels": {}}
+monitor.herdr = lambda *a, **k: ""
+monitor.publish([r]); monitor.publish([dict(r, pct=93.0)])
+assert len(sent) == 1 and sent[0][2] == "lead context 91%" and "billing · main · w1:p1" in sent[0], sent
+monitor.publish([dict(r, pct=40.0)]); monitor.publish([dict(r, pct=95.0)])           # re-armed below 50
+assert len(sent) == 2
+monitor.herdr_json = lambda *a: (sent.append(a), {"shown": False, "reason": "rate_limited"})[1]
+monitor.publish([dict(r, session="/u.jsonl")]); monitor.publish([dict(r, session="/u.jsonl")])
+assert len(sent) == 4                                                                   # retried after rate limit
+os.environ["AGENT_MONITOR_NOTIFY"] = "0"
+monitor.publish([dict(r, session="/v.jsonl")])
+assert len(sent) == 4
+del os.environ["AGENT_MONITOR_NOTIFY"], os.environ["HERDR_PLUGIN_STATE_DIR"]
+print("ok")
+
+# --- cost wording ----------------------------------------------------------------------------------
+base = {"usage": {"in": 1, "cr": 0, "cw": 0, "out": 1}}
+assert monitor.totals([dict(base, usd=1.0, usd_src="list")]).endswith("≈ $1.00 list price")
+assert "list price + agent-reported" in monitor.totals([dict(base, usd=1.0, usd_src="list"), dict(base, usd=2.0, usd_src="pi")])
+u = {"in": 1, "cr": 2, "cw": 30, "cw5m": 10, "cw1h": 20, "out": 3, "ctx": 6, "model": "m", "subagents": 0}
+assert "(1h 20 · 5m 10)" in monitor.usage_text(u, None, 1.0) and "1h at 2×" in monitor.usage_text(u, None, 1.0)
+assert "as recorded by pi" in monitor.usage_text(dict(u, cw1h=0), None, 1.0, "pi")
 print("ok")

@@ -30,9 +30,16 @@ ST PANE    AGENT        MODEL              CTX     CTX%  IN      CACHE R  CACHE 
 - **Per workspace**: scope it to one workspace, and agents that carry crew tokens show as a lead with its
   workers under it.
 
-Each refresh (every 2 s) reads one `herdr api snapshot`, Claude Code transcripts and Codex logs.
-Other agents (opencode, pi, OpenRouter CLIs) show the last lines of their screen and no token data.
-It is read-only: it does not change agents, hooks or herdr settings.
+- **In the sidebar**: an optional extra line under an agent once it nears a limit (context or cost), and a
+  toast when an agent's context passes 90%, both kept current even with no monitor pane open.
+
+Each refresh (every 2 s) reads one `herdr api snapshot` and the agents' own session files: Claude Code
+transcripts, Codex rollouts, pi sessions and opencode's database. Other agents (OpenRouter CLIs and the like)
+show the last lines of their screen and no token data.
+
+It only reads agents' data. The only things it writes are its own `am_*` sidebar tokens (source
+`ferretorres.agent-monitor`) and the context toast. It never changes agents, state labels, hooks or herdr
+settings.
 
 ## Requirements
 
@@ -135,26 +142,80 @@ Python 3.11+, else its default accents). Without it, PANE is not coloured.
   Subagent transcripts are added to the token totals.
 - Codex: the rollout in `$CODEX_HOME/sessions` (default `~/.codex/sessions`) with the session id, else the
   newest rollout of the last 3 days with the same working directory.
+- pi: the session file herdr's pi integration reports (or `<id>.jsonl` under `$PI_CODING_AGENT_SESSION_DIR`
+  or `${PI_CODING_AGENT_DIR:-~/.pi/agent}/sessions`). Totals count what pi's footer counts, subagent runs
+  included. The context window comes from pi's `models-store.json`, and the cost is the one pi recorded.
+  pi writes the file after its first reply, so until then the row shows the screen.
+- opencode: its SQLite database, `${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db` (or
+  `$OPENCODE_DB`), opened read-only on each refresh and closed at once. The session is herdr's session id,
+  else the newest session in the pane's folder. Totals include subagent sessions, OUT includes reasoning,
+  and the cost is opencode's own estimate. Newer opencode database layouts are not read yet; those rows
+  show the screen.
 - Other agents: `herdr agent read` in the background, one read per pane at a time. A pane is read again
   when its state changes or every 10 s, so one slow pane never delays the others.
 
+## Sidebar and toast
+
+The monitor puts one short line under an agent in herdr's sidebar when that agent needs watching, and
+nothing for a healthy one:
+
+```
+billing
+  ▲ ★ lead · claude
+    91% $159          red: 80% context or $50 and up
+  ● docs · pi
+    54% $3.4          yellow: 50% context or $10 and up
+  ○ review · opencode
+```
+
+It writes one of the tokens `am_bad`, `am_warn` (or `am_ok`, see below); add this row to
+`[ui.sidebar.agents] rows` in herdr's `config.toml` to show them (the
+[herdr-crew](https://github.com/ferretorres/herdr-crew) setup adds it for you):
+
+```toml
+[{ token = "$am_bad", fg = "#f38ba8", bold = true }, { token = "$am_warn", fg = "#f9e2af" }, { token = "$am_ok", fg = "#6c7086" }],
+```
+
+When an agent's context passes 90%, a toast says so once (`lead context 91%`, with its workspace, tab and
+pane), and again only after the context drops below 50% and climbs back. Herdr shows toasts only with
+`[ui.toast] delivery = "herdr"` (or `terminal` / `system`) in its config. Herdr already notifies you when an
+agent finishes or needs input, so the monitor does not repeat those.
+
+Both stay current without a monitor pane: a hook runs on every agent status change and updates that one
+agent. An open monitor also updates every agent it shows on each refresh. Tokens do not survive a herdr
+restart; they come back on each agent's next status change.
+
+| Setting | Values |
+| --- | --- |
+| `AGENT_MONITOR_SIDEBAR` | `warn` (default): a line only from 50% / $10 · `all`: a dim line for every agent with numbers · `off`: clear the line and write nothing |
+| `AGENT_MONITOR_NOTIFY` | `1` (default) · `0`: no context toast |
+
+The hook only sees variables set in the herdr server's environment.
+
 ## Costs
 
-COST uses Anthropic first-party list prices for Claude models. Bedrock, Vertex or gateway billing differs, so treat
+COST uses Anthropic first-party list prices for Claude models, with 1-hour cache writes priced at 2× input and
+5-minute ones at 1.25× (the details panel shows the split). pi and opencode rows use the cost those agents
+recorded; when pi recorded none, the list price applies. Bedrock, Vertex or gateway billing differs, so treat
 it as an estimate. To price other models, create `prices.json` in the plugin's config folder,
 `herdr plugin config-dir ferretorres.agent-monitor` (usually `~/.config/herdr/plugins/config/ferretorres.agent-monitor`),
 which `herdr plugin update` leaves alone. Prices are USD per 1M tokens, and a key matches any model name that
 contains it:
 
 ```json
-{"my-gateway-model": {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "ctx": 258400}}
+{"my-gateway-model": {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "cache_write_1h": 0, "ctx": 258400}}
 ```
+
+The longest matching key wins. Missing cache prices default to 0.1× (read), 1.25× (5-minute write) and 2×
+(1-hour write) the input price.
 
 ## Limits
 
 - Without a Codex session id, Codex sessions are matched by working directory, so two Codex agents in the
   same directory show the same session.
-- Codex subagent tokens are not included; Claude subagent tokens are.
+- Codex subagent tokens are not included; Claude, pi and opencode subagent tokens are.
+- Costs are priced on session totals, so Claude's per-request long-context tier, fast mode and regional
+  multipliers are not modelled. OpenAI models have no built-in prices; add them in `prices.json`.
 - `crew_lead` holds a pane id, which changes when a pane moves to another workspace. The crew plugin
   rewrites the token after a move; other tools that set it have to do the same.
 
