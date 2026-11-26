@@ -361,12 +361,40 @@ def snapshot():
     return herdr_json("api", "snapshot").get("snapshot") or {}
 
 
+def scope_workspace():
+    """None = every workspace, else the workspace id to show. AGENT_MONITOR_SCOPE is
+    all (default) | workspace | <workspace id>. `workspace` asks herdr where this pane is now,
+    so a monitor pane moved to another workspace follows it; HERDR_WORKSPACE_ID is the fallback."""
+    scope = os.environ.get("AGENT_MONITOR_SCOPE", "").strip() or "all"
+    if scope == "all":
+        return None
+    if scope != "workspace":
+        return scope
+    try:
+        ws = (herdr_json("pane", "current", "--current").get("pane") or {}).get("workspace_id")
+    except (HerdrError, subprocess.TimeoutExpired):
+        ws = None
+    return ws or os.environ.get("HERDR_WORKSPACE_ID") or None
+
+
+def scope_label(ws, snap):
+    if ws is None:
+        return "all workspaces"
+    w = next((w for w in snap.get("workspaces") or [] if w.get("workspace_id") == ws), None)
+    if w is None:
+        return f"workspace {ws} (not found)"
+    return f"workspace {w.get('label') or ws} ({ws})" if w.get("label") not in (None, "", ws) else f"workspace {ws}"
+
+
 def collect():
-    return build_rows(snapshot())
+    """(rows, scope label) for one refresh."""
+    ws = scope_workspace()
+    snap = snapshot()
+    return build_rows(snap, ws), scope_label(ws, snap)
 
 
-def build_rows(snap):
-    agents = snap.get("agents") or []
+def build_rows(snap, ws=None):
+    agents = [a for a in snap.get("agents") or [] if ws is None or a.get("workspace_id") == ws]
     panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
     spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
     hashed = None  # space-colors' own choice is on every pane as a token; hash only without it
@@ -581,7 +609,8 @@ def refresh_forever(state, every=2.0):
 
 def refresh_once(state):
     try:
-        state["data"] = (collect(), "")
+        rows, state["scope"] = collect()
+        state["data"] = (rows, "")
     except subprocess.TimeoutExpired as e:  # keep the last rows until herdr answers again
         state["data"] = (state["data"][0], f" ⚠ herdr did not answer: {' '.join(e.cmd[1:3])} ·")
     except HerdrError as e:  # e.g. server_not_running: say so instead of showing 0 agents
@@ -599,7 +628,7 @@ def tui(scr):
     sel = picked = 0
     detail = False
     drag = None  # column index being resized with the mouse
-    state = {"data": ([], " · loading…")}
+    state = {"data": ([], " loading… ·"), "scope": "…"}
     threading.Thread(target=refresh_forever, args=(state,), daemon=True).start()
     while True:
         cols = colsets[view]
@@ -607,29 +636,33 @@ def tui(scr):
         h, w = scr.getmaxyx()
         sel = min(sel, max(0, len(rows) - 1))
         picked = min(picked, len(cols) - 1)
-        body = h - 3 if view == "usage" else h - 2  # usage view has a totals line
+        # rows: 0 title (scope), 1 column header, 2.. agents, then [usage totals], status line
+        body = h - 4 if view == "usage" else h - 3
         list_h = body // 2 if detail and rows else body
         scr.erase()
+        scr.addnstr(0, 0, f" agent monitor · {state['scope']} · {len(rows)} agents", w - 1, curses.A_BOLD)
         spec = layout(cols, w - 1)
         for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
             if x < w - 1:
                 attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
-                scr.addnstr(0, x, fit(cols[i][0], cw), w - 1 - x, attr)
+                scr.addnstr(1, x, fit(cols[i][0], cw), w - 1 - x, attr)
                 if x + cw < w - 1:
-                    scr.addstr(0, x + cw, "│", C["dim"])
+                    scr.addstr(1, x + cw, "│", C["dim"])
         first = max(0, sel - list_h + 1)
         for n, r in enumerate(rows[first:first + list_h]):
-            y, rev = n + 1, curses.A_REVERSE if first + n == sel else 0
+            y, rev = n + 2, curses.A_REVERSE if first + n == sel else 0
             for i, x, cw in spec:
                 if x < w - 1:
                     name = cols[i][0]
                     scr.addnstr(y, x, fit(r["cells"][name], cw) + " ", w - 1 - x, cell_attr(C, r, name) | rev)
+        if not rows and not warn and list_h > 0:
+            scr.addnstr(2, 1, f"no agents in {state['scope']}", w - 2, C["dim"])
         if detail and rows:
-            draw_detail(scr, rows[sel], list_h + 1, body + 1, w, C)
+            draw_detail(scr, rows[sel], list_h + 2, body + 3, w, C)
         if view == "usage":
             scr.addnstr(h - 2, 0, totals(rows), w - 1, curses.A_BOLD)
         hidden = ",".join(c[0] for c in cols if c[1] == -1)
-        help_ = (f" [{view}] v: switch view · {len(rows)} agents · click row: details · drag │: width"
+        help_ = (f" [{view}] v: switch view · click row: details · drag │: width"
                  f" · ⏎ jump · ←→ +/- space: column · q quit")
         scr.addnstr(h - 1, 0, warn + help_ + (f" · hidden: {hidden}" if hidden else ""), w - 1,
                     C["warn"] if warn else C["dim"])
@@ -655,7 +688,7 @@ def tui(scr):
                 elif drag is not None and b in (0, 32):  # dragging a column edge
                     start = next(x for i, x, _ in spec if i == drag)
                     cols[drag][1] = max(2, mx - start)
-                elif b == 0 and down and my == 0:
+                elif b == 0 and down and my == 1:
                     edge = [i for i, x, cw in spec if abs(mx - (x + cw)) <= 1]
                     if edge:
                         drag = picked = edge[0]
@@ -663,8 +696,8 @@ def tui(scr):
                             cols[drag][1] = next(cw for i, _, cw in spec if i == drag)
                     else:
                         picked = next((i for i, x, cw in spec if x <= mx < x + cw), picked)
-                elif b == 0 and down and 1 <= my <= list_h and first + my - 1 < len(rows):
-                    clicked = first + my - 1
+                elif b == 0 and down and 2 <= my < 2 + list_h and first + my - 2 < len(rows):
+                    clicked = first + my - 2
                     detail = not (detail and clicked == sel)  # click again to close
                     sel = clicked
             continue
@@ -707,13 +740,14 @@ def once(argv):
     width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
     view = "usage" if "--usage" in argv else "activity"
     try:
-        rows = collect()
+        rows, scope = collect()
     except subprocess.TimeoutExpired as e:
         print(f"⚠ herdr did not answer: {' '.join(e.cmd[1:3])}", file=sys.stderr)
         return 1
     except HerdrError as e:
         print(f"⚠ herdr: {e}", file=sys.stderr)
         return 1
+    print(f"agent monitor · {scope} · {len(rows)} agents"[:width])
     print("\n".join(frame(rows, VIEWS[view], width)))
     if view == "usage":
         print(totals(rows))

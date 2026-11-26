@@ -124,7 +124,7 @@ monitor.HERDR = fake_herdr({"api snapshot": (0, json.dumps({"id": "s", "result":
 calls = []
 real = monitor.herdr
 monitor.herdr = lambda *a, **k: (calls.append(a[:2]), real(*a, **k))[1]
-rows = {r["pane"]: r for r in monitor.collect()}
+rows = {r["pane"]: r for r in monitor.collect()[0]}
 assert sum(1 for c in calls if c != ("agent", "read")) == 1, calls          # only `api snapshot`
 monitor.herdr = real
 assert rows["w1:p1"]["space"] == "teal"     # the agent's own token
@@ -132,6 +132,40 @@ assert rows["w1:p2"]["space"] == "pink"     # else the pane's token
 # no token anywhere: space-colors' hash of the first non-empty pane cwd in that workspace
 assert rows["w2:p1"]["space"] == names[fnv1a("/b/c") % 8], rows["w2:p1"]["space"]
 assert monitor.sc_palette({"x": "1"}, {"sc_my-own": "●"}) == "my-own" and monitor.sc_palette({}) is None
+print("ok")
+
+# --- AGENT_MONITOR_SCOPE -------------------------------------------------------------------------
+def scoped(value, herdr_path, ws_env=None):
+    os.environ["AGENT_MONITOR_SCOPE"] = value
+    os.environ.pop("HERDR_WORKSPACE_ID", None)
+    if ws_env:
+        os.environ["HERDR_WORKSPACE_ID"] = ws_env
+    monitor.HERDR = herdr_path
+    try:
+        return monitor.scope_workspace()
+    finally:
+        os.environ.pop("AGENT_MONITOR_SCOPE")
+        os.environ.pop("HERDR_WORKSPACE_ID", None)
+
+
+CURRENT = json.dumps({"id": "c", "result": {"type": "pane_info", "pane": {"pane_id": "w2:p3", "workspace_id": "w2"}}})
+here = fake_herdr({"pane current": (0, CURRENT)})
+broken = fake_herdr({"pane current": (1, NOT_RUNNING)})
+assert monitor.scope_workspace() is None                       # unset = all
+assert scoped("all", here) is None and scoped("w7", here) == "w7"
+assert scoped("workspace", here, ws_env="w1") == "w2"          # live workspace wins over the launch env
+assert scoped("workspace", broken, ws_env="w1") == "w1"        # fallback: HERDR_WORKSPACE_ID
+assert scoped("workspace", broken) is None                     # nothing known: all
+rows = monitor.build_rows(SNAP, "w1")
+assert sorted(r["pane"] for r in rows) == ["w1:p1", "w1:p2"]
+assert monitor.scope_label("w1", SNAP) == "workspace one (w1)"
+assert monitor.scope_label(None, SNAP) == "all workspaces" and "not found" in monitor.scope_label("w9", SNAP)
+os.environ["AGENT_MONITOR_SCOPE"] = "workspace"
+monitor.HERDR = fake_herdr({"pane current": (0, CURRENT), "agent read": (0, ""),
+                            "api snapshot": (0, json.dumps({"result": {"snapshot": SNAP}}))})
+rows, label = monitor.collect()
+assert [r["pane"] for r in rows] == ["w2:p1"] and label == "workspace two (w2)", (rows, label)
+os.environ.pop("AGENT_MONITOR_SCOPE")
 print("ok")
 
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
