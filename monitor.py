@@ -350,6 +350,51 @@ def screen_activity(pane_id):
     return "", "screen: " + " ⏎ ".join(lines[-2:]), None
 
 
+SCREEN_MAX_AGE = 10.0  # seconds: re-read an unchanged pane's screen at least this often
+_screen = {}  # pane id -> {"key", "at", "value", "thread"}
+_screen_lock = threading.Lock()
+
+
+def screen_start(a):
+    """Start a background `agent read` for an agent without a transcript, when its pane changed
+    (revision / state_change_seq / status) or the last read is old. Never waits, so a pane
+    herdr is slow to read only delays its own row; at most one read per pane is in flight."""
+    pane = a["pane_id"]
+    key = (a.get("revision"), a.get("state_change_seq"), a.get("agent_status"))
+    with _screen_lock:
+        e = _screen.setdefault(pane, {"key": None, "at": 0.0, "value": ("", "screen: (reading…)", None),
+                                      "thread": None})
+        if e["thread"] is None and (e["key"] != key or time.time() - e["at"] > SCREEN_MAX_AGE):
+            e["key"] = key
+            e["thread"] = threading.Thread(target=_read_screen, args=(pane, e), daemon=True)
+            e["thread"].start()
+    return e
+
+
+def _read_screen(pane, e):
+    try:
+        value = screen_activity(pane)
+    except Exception as ex:  # a background thread must not die silently with the entry locked busy
+        value = ("", f"screen: ({ex})", None)
+    with _screen_lock:
+        e["value"], e["at"], e["thread"] = value, time.time(), None
+
+
+def screen_wait(entries, timeout=6.0):
+    """Block until these reads finish (for --once)."""
+    end = time.time() + timeout
+    for e in entries:
+        t = e["thread"]
+        if t is not None:
+            t.join(max(0.0, end - time.time()))
+
+
+def screen_prune(panes):
+    with _screen_lock:
+        for pane in [p for p, e in _screen.items() if p not in panes and e["thread"] is None]:
+            del _screen[pane]
+
+
 def load_prices():
     prices = dict(PRICES)
     try:
@@ -476,31 +521,45 @@ def scope_label(ws, snap):
     return f"workspace {w.get('label') or ws} ({ws})" if w.get("label") not in (None, "", ws) else f"workspace {ws}"
 
 
-def collect():
-    """(rows, scope label) for one refresh."""
+def collect(wait=False):
+    """(rows, scope label) for one refresh. wait: block for screen reads (one-shot output)."""
     ws = scope_workspace()
     snap = snapshot()
-    return build_rows(snap, ws), scope_label(ws, snap)
+    return build_rows(snap, ws, wait), scope_label(ws, snap)
 
 
-def build_rows(snap, ws=None):
+def transcript(a):
+    """The agent's Claude transcript or Codex rollout, if it has one."""
+    s = a.get("agent_session") or {}
+    if a["agent"] == "claude":
+        return claude_path(s.get("kind"), s.get("value"))
+    if a["agent"] == "codex":
+        return codex_path(a.get("cwd"), s.get("kind"), s.get("value"))
+    return None
+
+
+def build_rows(snap, ws=None, wait=False):
     agents = [a for a in snap.get("agents") or [] if ws is None or a.get("workspace_id") == ws]
+    found = {a["pane_id"]: transcript(a) for a in agents}
+    screens = {a["pane_id"]: screen_start(a) for a in agents if not found[a["pane_id"]]}
+    if wait:
+        screen_wait(screens.values())
+    screen_prune(screens)
     panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
     spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
     hashed = None  # space-colors' own choice is on every pane as a token; hash only without it
     prices = load_prices()
     rows = []
     for a in agents:
-        kind, sess = (a.get("agent_session") or {}).get("kind"), (a.get("agent_session") or {}).get("value")
-        path = usage = None
-        if a["agent"] == "claude" and (path := claude_path(kind, sess)):
+        path, usage = found[a["pane_id"]], None
+        if path and a["agent"] == "claude":
             prompt, now, ts = claude_activity(path)
             usage = claude_usage(path)
-        elif a["agent"] == "codex" and (path := codex_path(a.get("cwd"), kind, sess)):
+        elif path:
             prompt, now, ts = codex_activity(path)
             usage = codex_usage(path)
         else:
-            prompt, now, ts = screen_activity(a["pane_id"])
+            prompt, now, ts = screens[a["pane_id"]]["value"]
         price = price_for(usage and usage["model"], prices)
         window = (usage or {}).get("window") or (price or {}).get("ctx")
         usd = cost(usage, price) if usage else None
@@ -873,7 +932,7 @@ def once(argv):
     width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
     view = "usage" if "--usage" in argv else "activity"
     try:
-        rows, scope = collect()
+        rows, scope = collect(wait=True)
     except subprocess.TimeoutExpired as e:
         print(f"⚠ herdr did not answer: {' '.join(e.cmd[1:3])}", file=sys.stderr)
         return 1

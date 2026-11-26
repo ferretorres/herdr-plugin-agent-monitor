@@ -257,13 +257,41 @@ monitor.prune_caches()                      # next refresh did not: dropped from
 assert gone not in monitor._new and gone not in monitor._cu and gone not in monitor._tail and t in monitor._cu
 print("ok")
 
+# --- screen reads: background, one per pane, only when the pane changed ----------------------------
+import time
+monitor._screen.clear()
+monitor.HERDR = fake_herdr({"agent read": (0, "slow pane finally answered\n")}, sleep={"agent read": 2})
+snap = {"agents": [agent("w1:p1", revision=1), agent("w1:p2", revision=1)]}
+t0 = time.time()
+rows = monitor.build_rows(snap)
+assert time.time() - t0 < 1.0, "a slow `agent read` must not stall the refresh"
+assert rows[0]["cells"]["NOW"] == "screen: (reading…)"
+rows = monitor.build_rows(snap, wait=True)                      # --once waits for the reads
+assert rows[0]["cells"]["NOW"] == "screen: slow pane finally answered", rows[0]["cells"]["NOW"]
+
+reads = []
+real_screen = monitor.screen_activity
+monitor.screen_activity = lambda pane: reads.append(pane) or ("", "screen: x", None)
+monitor.build_rows(snap, wait=True)
+assert reads == [], reads                                       # same revision, fresh: no read
+snap["agents"][0]["revision"] = 2
+monitor.build_rows(snap, wait=True)
+assert reads == ["w1:p1"], reads                                # only the pane that changed
+monitor._screen["w1:p2"]["at"] -= monitor.SCREEN_MAX_AGE + 1
+monitor.build_rows(snap, wait=True)
+assert reads == ["w1:p1", "w1:p2"], reads                       # and old reads are refreshed
+monitor.build_rows({"agents": [agent("w1:p1", revision=2)]})
+assert "w1:p2" not in monitor._screen                           # gone pane forgotten
+monitor.screen_activity = real_screen
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"
 print("ok")
 
 # The background refresh keeps the last rows and sets a warning when herdr times out.
-def boom():
+def boom(*a, **k):
     raise subprocess.TimeoutExpired(["herdr", "agent", "list"], 5)
 monitor.collect = boom
 state = {"data": (["row"], "")}
