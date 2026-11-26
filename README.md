@@ -130,7 +130,8 @@ matches any model name that contains it):
 - Without a Codex session id, Codex sessions are matched by working directory, so two Codex agents in the
   same directory show the same session.
 - Codex subagent tokens are not included; Claude subagent tokens are.
-- `crew_lead` holds a pane id. Pane ids change when a pane moves, so the crew plugin has to update the token.
+- `crew_lead` holds a pane id, which changes when a pane moves to another workspace. The crew plugin
+  rewrites the token after a move; other tools that set it have to do the same.
 
 ## Check
 
