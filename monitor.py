@@ -31,7 +31,7 @@ VIEWS = {
     "usage": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
               ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]],
 }
-# Anthropic first-party list prices, USD per 1M tokens (claude-api skill, cached 2026-11-03).
+# Anthropic first-party list prices, USD per 1M tokens (https://www.anthropic.com/pricing, 2026-11-03).
 # Bedrock / gateway billing differs, so COST is an estimate. Add other models in prices.json:
 # {"my-gateway-model": {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "ctx": 258400}}
 PRICES = {
@@ -448,7 +448,8 @@ def ago(ts):
 # Workspace colours come from ferretorres/herdr-plugin-space-colors, which puts an sc_<palette>
 # token on each agent, pane and workspace. Its config names the accent of each palette; without
 # that config (or on Python < 3.11, which has no tomllib) its default accents apply.
-SPACE_CONFIG = f"{HOME}/.config/herdr/plugins/config/ferretorres.space-colors/config.toml"
+SPACE_CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                            "herdr", "plugins", "config", "ferretorres.space-colors", "config.toml")
 SPACE_ACCENTS = {"blue": "#89b4fa", "green": "#a6e3a1", "mauve": "#cba6f7", "peach": "#fab387",
                  "pink": "#f5c2e7", "red": "#f38ba8", "teal": "#94e2d5", "yellow": "#f9e2af"}
 
