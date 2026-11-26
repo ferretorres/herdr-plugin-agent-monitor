@@ -36,9 +36,45 @@ PRICES = {
 }
 
 
-def herdr(*args):
-    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=5)
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"  # plugin panes get it; GUI launches may lack PATH
+
+
+class HerdrError(Exception):
+    """herdr could not be run, exited non-zero, or answered with an error object."""
+
+
+def error_text(out, err, rc):
+    """'code: message' from herdr's JSON error (on stdout or stderr), else the raw text."""
+    for text in (out, err):
+        try:
+            e = json.loads(text)["error"]
+            return f"{e.get('code', 'error')}: {e.get('message', '')}".rstrip(": ")
+        except (ValueError, KeyError, TypeError):
+            pass
+    return one_line(err or out, 160) or f"herdr exited with code {rc}"
+
+
+def herdr(*args, timeout=5):
+    """stdout of `herdr ARGS`; HerdrError when herdr fails, TimeoutExpired when it hangs."""
+    try:
+        r = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
+    except OSError as e:
+        raise HerdrError(f"cannot run {HERDR}: {e.strerror or e}")
+    if r.returncode != 0:
+        raise HerdrError(error_text(r.stdout, r.stderr, r.returncode))
     return r.stdout
+
+
+def herdr_json(*args):
+    """The `result` object of a herdr JSON command."""
+    out = herdr(*args)
+    try:
+        obj = json.loads(out)
+    except ValueError:
+        raise HerdrError(f"herdr {' '.join(args[:2])}: unreadable answer {one_line(out, 60)!r}")
+    if not isinstance(obj, dict) or "error" in obj:
+        raise HerdrError(error_text(out, "", 0))
+    return obj.get("result") or {}
 
 
 def one_line(s, n=300):
@@ -218,6 +254,8 @@ def screen_activity(pane_id):
         lines = herdr("agent", "read", pane_id, "--source", "recent", "--lines", "40").splitlines()
     except subprocess.TimeoutExpired:  # herdr can be slow to snapshot a busy pane; skip it this round
         return "", "screen: (herdr did not answer in 5 s)", None
+    except HerdrError as e:
+        return "", f"screen: ({e})", None
     lines = [l.strip() for l in lines if sum(ch.isalnum() for ch in l) > 5]  # drop borders
     return "", "screen: " + " ⏎ ".join(lines[-2:]), None
 
@@ -301,9 +339,9 @@ def choose_palette(label, cwd, accents, rules, auto):
 
 def workspace_palettes(accents, rules, auto):
     try:
-        panes = json.loads(herdr("pane", "list"))["result"]["panes"]
-        spaces = json.loads(herdr("workspace", "list"))["result"]["workspaces"]
-    except (ValueError, KeyError):
+        panes = herdr_json("pane", "list").get("panes") or []
+        spaces = herdr_json("workspace", "list").get("workspaces") or []
+    except HerdrError:
         return {}
     first_cwd = {}
     for p in panes:
@@ -313,10 +351,7 @@ def workspace_palettes(accents, rules, auto):
 
 
 def collect():
-    try:
-        agents = json.loads(herdr("agent", "list"))["result"]["agents"]
-    except (ValueError, KeyError):
-        return []
+    agents = herdr_json("agent", "list").get("agents") or []  # HerdrError -> warning line
     prices = load_prices()
     space = workspace_palettes(*load_space_colors())
     rows = []
@@ -525,7 +560,9 @@ def refresh_once(state):
     try:
         state["data"] = (collect(), "")
     except subprocess.TimeoutExpired as e:  # keep the last rows until herdr answers again
-        state["data"] = (state["data"][0], f" · ⚠ herdr did not answer: {' '.join(e.cmd[1:3])}")
+        state["data"] = (state["data"][0], f" ⚠ herdr did not answer: {' '.join(e.cmd[1:3])} ·")
+    except HerdrError as e:  # e.g. server_not_running: say so instead of showing 0 agents
+        state["data"] = (state["data"][0], f" ⚠ herdr: {e} ·")
 
 
 def tui(scr):
@@ -636,17 +673,33 @@ def tui(scr):
                 saved[(view, picked)], cols[picked][1] = cols[picked][1], -1
             save_cols(colsets)
         elif k in (10, 13, curses.KEY_ENTER) and rows:
-            herdr("agent", "focus", rows[sel]["pane"])
+            try:
+                herdr("agent", "focus", rows[sel]["pane"])
+            except (HerdrError, subprocess.TimeoutExpired):
+                pass  # the pane is gone; the next refresh drops its row
+
+
+def once(argv):
+    """Print one plain frame; exit code 1 with a warning when herdr fails or hangs."""
+    width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
+    view = "usage" if "--usage" in argv else "activity"
+    try:
+        rows = collect()
+    except subprocess.TimeoutExpired as e:
+        print(f"⚠ herdr did not answer: {' '.join(e.cmd[1:3])}", file=sys.stderr)
+        return 1
+    except HerdrError as e:
+        print(f"⚠ herdr: {e}", file=sys.stderr)
+        return 1
+    print("\n".join(frame(rows, VIEWS[view], width)))
+    if view == "usage":
+        print(totals(rows))
+    return 0
 
 
 if __name__ == "__main__":
     if "--once" in sys.argv:
-        width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
-        view = "usage" if "--usage" in sys.argv else "activity"
-        rows = collect()
-        print("\n".join(frame(rows, VIEWS[view], width)))
-        if view == "usage":
-            print(totals(rows))
+        sys.exit(once(sys.argv))
     else:
         os.environ.setdefault("ESCDELAY", "25")  # Esc closes details without a 1 s lag
         sys.stdout.write("\033[?1002h\033[?1006h")  # mouse press/drag/release, SGR coordinates

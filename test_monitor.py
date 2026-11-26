@@ -50,8 +50,64 @@ assert choose_palette("x", "/zzz", SPACE_ACCENTS, rules, False) is None        #
 assert nearest_256("#ff0000") == 196 and nearest_256("#000000") == 16
 print("ok")
 
+# --- herdr calls -------------------------------------------------------------------------------
+import os, stat, sys, subprocess, monitor
+
+FAKE_DIR = tempfile.mkdtemp()
+
+
+def fake_herdr(answers, sleep=None):
+    """An executable that answers like herdr: answers maps 'arg0 arg1' -> (exit code, stdout)."""
+    path = os.path.join(FAKE_DIR, f"herdr{len(os.listdir(FAKE_DIR))}")
+    with open(path, "w") as f:
+        f.write(f"#!{sys.executable}\nimport sys, time\nA = {answers!r}\nS = {sleep!r}\n"
+                "key = ' '.join(sys.argv[1:3])\n"
+                "if S and key in S: time.sleep(S[key])\n"
+                "rc, out = A.get(key, (1, '{\"error\":{\"code\":\"unknown_command\",\"message\":\"' + key + '\"}}'))\n"
+                "sys.stdout.write(out)\nsys.exit(rc)\n")
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    return path
+
+
+NOT_RUNNING = '{"id":"x","error":{"code":"server_not_running","message":"no herdr server is running"}}'
+
+# HERDR_BIN_PATH picks the binary; without it, "herdr" from PATH.
+env = dict(os.environ, HERDR_BIN_PATH="/opt/x/herdr")
+assert subprocess.run([sys.executable, "-c", "import monitor; print(monitor.HERDR)"], env=env,
+                      capture_output=True, text=True).stdout.strip() == "/opt/x/herdr"
+env.pop("HERDR_BIN_PATH")
+assert subprocess.run([sys.executable, "-c", "import monitor; print(monitor.HERDR)"], env=env,
+                      capture_output=True, text=True).stdout.strip() == "herdr"
+
+# A non-zero exit with herdr's JSON error becomes HerdrError("code: message"), not an empty list.
+monitor.HERDR = fake_herdr({"agent list": (1, NOT_RUNNING)})
+try:
+    monitor.herdr_json("agent", "list")
+    raise AssertionError("expected HerdrError")
+except monitor.HerdrError as e:
+    assert str(e) == "server_not_running: no herdr server is running", e
+monitor.HERDR = "/nonexistent/herdr"
+try:
+    monitor.herdr("agent", "list")
+    raise AssertionError("expected HerdrError")
+except monitor.HerdrError as e:
+    assert "cannot run" in str(e)
+
+# The refresh shows the server error as a warning and keeps the last rows.
+monitor.HERDR = fake_herdr({"agent list": (1, NOT_RUNNING), "api snapshot": (1, NOT_RUNNING)})
+state = {"data": (["row"], "")}
+monitor.refresh_once(state)
+assert state["data"][0] == ["row"] and "server_not_running" in state["data"][1], state
+
+# --once prints the warning and exits 1 instead of a traceback or an empty table.
+import contextlib, io
+err = io.StringIO()
+with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+    assert monitor.once(["--once"]) == 1
+assert "server_not_running" in err.getvalue()
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
-import subprocess, monitor
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"
 print("ok")
@@ -63,4 +119,11 @@ monitor.collect = boom
 state = {"data": (["row"], "")}
 monitor.refresh_once(state)
 assert state["data"][0] == ["row"] and "agent list" in state["data"][1]
+print("ok")
+
+# --once reports a hung herdr instead of a traceback.
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    assert monitor.once(["--once"]) == 1
+assert "did not answer" in err.getvalue()
 print("ok")
