@@ -229,6 +229,34 @@ assert [r["pane"] for r in rows] == ["w2:p1", "w10:p1", "w1:p1"]    # unknown so
 assert rows[-1]["cells"]["ST"] == "◌"
 print("ok")
 
+# --- caches: truncation, stat-keyed tails, pruning -------------------------------------------------
+t = jsonl([a("m1", u(10, 0, 0, 5)), a("m2", u(20, 0, 0, 5))])
+assert monitor.claude_file_usage(t)[0] == [30, 0, 0, 10]
+with open(t, "w") as f:                       # rewritten shorter: start over, don't stall at the old offset
+    f.write(json.dumps(a("m9", u(1, 0, 0, 1))) + "\n")
+assert monitor.claude_file_usage(t)[0] == [1, 0, 0, 1]
+with open(t, "a") as f:
+    f.write(json.dumps(a("m10", u(2, 0, 0, 2))) + "\n")
+assert monitor.claude_file_usage(t)[0] == [3, 0, 0, 3]
+
+parsed = []
+probe = lambda path: parsed.append(path) or len(parsed)
+assert monitor.cached_tail(t, probe) == 1 and monitor.cached_tail(t, probe) == 1   # unchanged: no re-parse
+with open(t, "a") as f:
+    f.write("{}\n")
+assert monitor.cached_tail(t, probe) == 2                                         # grew: parsed again
+
+gone = jsonl([a("m1", u(1, 0, 0, 1))])
+monitor._touched.clear()
+monitor.claude_file_usage(gone)
+monitor.claude_activity(gone)
+monitor.prune_caches()                      # this refresh used it: kept
+assert gone in monitor._new and gone in monitor._cu and gone in monitor._tail
+monitor.claude_file_usage(t)
+monitor.prune_caches()                      # next refresh did not: dropped from every cache
+assert gone not in monitor._new and gone not in monitor._cu and gone not in monitor._tail and t in monitor._cu
+print("ok")
+
 # A pane whose screen herdr can't read in time shows a note instead of crashing the monitor.
 monitor.herdr = lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired(["herdr", *a], 5))
 assert monitor.screen_activity("w1:p1")[1] == "screen: (herdr did not answer in 5 s)"

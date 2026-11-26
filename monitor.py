@@ -96,24 +96,53 @@ def tail_lines(path, size=400_000):
     return out
 
 
-_new = {}  # path -> byte offset already read
+_new = {}  # path -> (inode, byte offset already read)
+_tail = {}  # path -> ((mtime_ns, size), parsed result)
+_touched = set()  # paths read during this refresh; caches of the others are dropped after it
 
 
 def new_lines(path):
-    """JSON objects appended to path since the last call (whole lines only)."""
-    off = _new.get(path, 0)
+    """(JSON objects appended to path since the last call, whole lines only; rewound).
+    rewound is True when the file was truncated or replaced, so callers restart their sums."""
+    _touched.add(path)
+    st = os.stat(path)
+    ino, off = _new.get(path, (st.st_ino, 0))
+    rewound = ino != st.st_ino or st.st_size < off
+    if rewound:
+        off = 0
     with open(path, "rb") as f:
         f.seek(off)
         data = f.read()
     end = data.rfind(b"\n") + 1
-    _new[path] = off + end
+    _new[path] = (st.st_ino, off + end)
     out = []
     for line in data[:end].splitlines():
         try:
             out.append(json.loads(line))
         except ValueError:
             pass
-    return out
+    return out, rewound
+
+
+def cached_tail(path, parse):
+    """parse(path), re-run only when the file's mtime or size changed."""
+    _touched.add(path)
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _tail.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    result = parse(path)
+    _tail[path] = (key, result)
+    return result
+
+
+def prune_caches():
+    """Forget files no agent in view used this refresh (gone agents, rotated transcripts)."""
+    for cache in (_new, _tail, _cu, _xu):
+        for path in [p for p in cache if p not in _touched]:
+            del cache[path]
+    _touched.clear()
 
 
 def is_human(text):
@@ -161,6 +190,10 @@ def claude_path(kind, value):
 
 
 def claude_activity(path):
+    return cached_tail(path, _claude_activity)
+
+
+def _claude_activity(path):
     prompt = now = ""
     for o in tail_lines(path):
         msg = o.get("message") or {}
@@ -186,8 +219,12 @@ _cu = {}  # transcript path -> running usage
 def claude_file_usage(path):
     """Sum usage over a Claude transcript. One API reply is written as several lines with the
     same message id, so count each id once, using the last line seen for it."""
-    st = _cu.setdefault(path, {"tot": [0, 0, 0, 0], "id": None, "cur": [0, 0, 0, 0], "ctx": 0, "model": ""})
-    for o in new_lines(path):
+    fresh = lambda: {"tot": [0, 0, 0, 0], "id": None, "cur": [0, 0, 0, 0], "ctx": 0, "model": ""}
+    st = _cu.setdefault(path, fresh())
+    objs, rewound = new_lines(path)
+    if rewound:
+        st = _cu[path] = fresh()
+    for o in objs:
         msg = o.get("message") or {}
         u = msg.get("usage")
         if o.get("type") != "assistant" or not u:
@@ -253,6 +290,10 @@ def codex_path(cwd, kind=None, value=None):
 
 
 def codex_activity(path):
+    return cached_tail(path, _codex_activity)
+
+
+def _codex_activity(path):
     prompt = now = ""
     for o in tail_lines(path):
         p = o.get("payload") or {}
@@ -280,7 +321,10 @@ _xu = {}  # rollout path -> latest token_count info + model
 
 def codex_usage(path):
     st = _xu.setdefault(path, {"info": None, "model": ""})
-    for o in new_lines(path):
+    objs, rewound = new_lines(path)
+    if rewound:
+        st = _xu[path] = {"info": None, "model": ""}
+    for o in objs:
         p = o.get("payload") or {}
         if p.get("type") == "token_count" and p.get("info"):
             st["info"] = p["info"]
@@ -490,6 +534,7 @@ def build_rows(snap, ws=None):
                     + ([("CREW", " · ".join(x for x in (crew, role, lead and f"lead {lead}") if x))]
                        if role or crew else []),
         })
+    prune_caches()
     rows.sort(key=lambda r: (ORDER.get(r["status"], len(ORDER)), pane_key(r["pane"])))
     return tree_order(rows)
 
