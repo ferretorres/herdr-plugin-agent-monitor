@@ -13,9 +13,10 @@ from the pane.agent_status_changed hook (`monitor.py --hook`).
 Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspace) | <workspace id>[,<id>...].
 The w picker replaces it with all workspaces or a set of them, saved per monitor pane (HERDR_PANE_ID) of each
 herdr server for the AGENT_MONITOR_SCOPE it was made under.
-Rows go by workspace in sidebar order; inside one, crew tokens order them: a lead (crew_role=lead), then
-its workers (crew_lead=<lead pane>). A second mate (a lead with crew_mate_of=<its first mate's lead pane>)
-is listed under its first mate with its own workers, in the first mate's workspace.
+Rows go by workspace, the one with the most urgent agent first, then in sidebar order. Inside one, crew
+tokens make the tree: a lead (crew_role=lead), then its workers (crew_lead=<lead pane>), each branch by its
+most urgent agent. A second mate (a lead with crew_mate_of=<its first mate's lead pane>) is listed under its
+first mate with its own workers, in the first mate's workspace.
 
 Views (v to switch): activity (goal, last prompt, current action) and usage (context, tokens, cost).
 Mouse: click a row for full details (click again to close), drag a header │ to resize,
