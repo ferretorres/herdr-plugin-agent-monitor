@@ -922,7 +922,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
         first = firsts.get(a["pane_id"])
         mate_of = _s(tokens.get("crew_mate_of")) if role == "lead" else ""
-        if mate_of in found and not first:  # found keys every shown pane; a link to one is named only if drawn
+        if mate_of in found and not first:  # found keys every listed agent; a link to one is named only if it nests
             mate_of = ""
         n = sum(f == a["pane_id"] for f in firsts.values())
         links = (lead and f"lead {lead}", mate_of and f"second mate of {mate_of}",

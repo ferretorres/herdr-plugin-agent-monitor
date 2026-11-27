@@ -159,8 +159,9 @@ listed in the first mate's workspace; WORKSPACE still names each row's own works
 in that tree moves the workspace up, and at each level of the tree the branch with the most urgent agent comes
 first, so a blocked agent is listed near the top of the tree, not after the other crews. A second mate whose
 first mate is not shown is listed at the top level of its own workspace, with its workers under it. A lead
-whose `crew_mate_of` names itself, a pane that is not a lead, or a loop of links stays at the top level, and
-its CREW line leaves that link out.
+whose `crew_mate_of` names itself, a pane that is not a lead, or a loop of links stays at the top level. Its
+CREW line names the link only when the row is nested under that first mate, or when the linked pane is not in
+the list (for example, a first mate in a workspace that is not picked).
 
 The PANE column widens to fit. The details panel (`d`) has a CREW line, which names the link:
 `web · lead · second mate of w1:p2`, or `alpha · lead · first mate of 1 second mate`.
