@@ -889,6 +889,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
     agents = [e for e in map(agent_entry, snap.get("agents") or [])
               if e and (keep is None or e.get("workspace_id") in keep)]
     found = {a["pane_id"]: transcript(a) for a in agents}
+    listed = {a["pane_id"] for a in agents}
     oc = {a["pane_id"]: opencode_read(a) for a in agents if a["agent"] == "opencode"}
     want_screen = [a for a in agents if not found[a["pane_id"]] and not oc.get(a["pane_id"])]
     if screens:
@@ -922,7 +923,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
         first = firsts.get(a["pane_id"])
         mate_of = _s(tokens.get("crew_mate_of")) if role == "lead" else ""
-        if mate_of in found and not first:  # found keys every listed agent; a link to one is named only if it nests
+        if mate_of in listed and not first:  # a link to a listed agent is named only when it nests this row
             mate_of = ""
         n = sum(f == a["pane_id"] for f in firsts.values())
         links = (lead and f"lead {lead}", mate_of and f"second mate of {mate_of}",
@@ -1004,9 +1005,9 @@ def space_order(rows, spaces):
     then in snapshot (sidebar) order, then workspaces the snapshot does not list, by id; each workspace's
     rows in tree_order, so a worker whose lead is elsewhere is a root. A first mate's whole tree (its
     workers, its second mates and theirs) is listed in the first mate's workspace and counts for its
-    urgency, though each row still names its own workspace. In the workspace that lists such a tree, every
-    branch, top-level ones included, goes by the most urgent agent in it, then its own status and pane, so a
-    blocked agent is not listed below another crew's rows; the other workspaces keep the order of rows."""
+    urgency, though each row still names its own workspace. In every workspace, each branch, top-level ones
+    included, goes by the most urgent agent in it as listed there, then its own status and pane, so a blocked
+    agent is not listed below another crew's rows."""
     pos = {ws: n for n, ws in enumerate(spaces)}
     rank = lambda r: ORDER.get(r["status"], len(ORDER))
     path, home = [], {}
@@ -1019,7 +1020,6 @@ def space_order(rows, spaces):
         top = home[r["pane"]]
         groups.setdefault(top["ws"] if top["pane"] in mated else r["ws"], []).append(r)
     urgent = {ws: min(map(rank, rs)) for ws, rs in groups.items()}
-    mixed = {r["ws"] for r in rows if r["pane"] in mated}
 
     def by_branch(rs):  # sorted() is stable and rows come by status, then pane, so ties keep that order
         path, best = [], {}
@@ -1030,7 +1030,7 @@ def space_order(rows, spaces):
         return sorted(rs, key=lambda r: best[r["pane"]])
 
     return [r for ws in sorted(groups, key=lambda ws: (urgent[ws], pos.get(ws, len(pos)), pane_key(ws)))
-            for r in tree_order(by_branch(groups[ws]) if ws in mixed else groups[ws])]
+            for r in tree_order(by_branch(groups[ws]))]
 
 
 def tree_order(rows):
