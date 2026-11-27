@@ -7,10 +7,10 @@ and how full is its context?" without switching panes.
 ```
 agent monitor · all workspaces · 4 agents
 ST WORKSPACE  PANE    AGENT        AGE   GOAL                               LAST PROMPT                              NOW
+▲  infra      w2:p1   codex              Migrate CI to the new runner                                                screen: Allow command: terraform plan? [y/…
 ●  shop       w1:p1   lead-shop    0s    Lead: checkout refactor            Ship the checkout refactor: split the w… Bash: crew wait --timeout 300
 ●  shop       └ w1:p3 shop-tests   0s    Tests for price rounding           Write tests for the new price rounding … Edit: tests/test_totals.py
 ○  shop       └ w1:p4 shop-docs    0s    Checkout API docs                  Update the API docs for the checkout en… Read: docs/api/checkout.md
-▲  infra      w2:p1   codex              Migrate CI to the new runner                                                screen: Allow command: terraform plan? [y/…
 ```
 
 - **Activity view**: workspace, status, goal, last prompt and the action the agent is taking right now. Rows
@@ -21,10 +21,10 @@ ST WORKSPACE  PANE    AGENT        AGE   GOAL                               LAST
 ```
 agent monitor · all workspaces · 4 agents
 ST WORKSPACE  PANE    AGENT        MODEL              CTX     CTX%  IN      CACHE R  CACHE W  OUT     COST     AGE   GOAL
+▲  infra      w2:p1   codex                                                                                          Migrate CI to the new runner
 ●  shop       w1:p1   lead-shop    claude-opus-5-5    195k    20%   4k      182k     9k       3k      $0.16    0s    Lead: checkout refactor
 ●  shop       └ w1:p3 shop-tests   claude-sonnet-5-5  70k     7%    2k      64k      4k       2k      $0.04    0s    Tests for price rounding
 ○  shop       └ w1:p4 shop-docs    claude-haiku-5-5   24k     2%    900     21k      2k       800     $0.00    0s    Checkout API docs
-▲  infra      w2:p1   codex                                                                                          Migrate CI to the new runner
 Σ in 7k · cache r 267k · cache w 15k · out 6k · ≈ $0.20 list price
 ```
 
