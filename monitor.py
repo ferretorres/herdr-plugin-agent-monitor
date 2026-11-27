@@ -1004,30 +1004,33 @@ def space_order(rows, spaces):
     then in snapshot (sidebar) order, then workspaces the snapshot does not list, by id; each workspace's
     rows in tree_order, so a worker whose lead is elsewhere is a root. A first mate's whole tree (its
     workers, its second mates and theirs) is listed in the first mate's workspace and counts for its
-    urgency, though each row still names its own workspace. In that tree, siblings go by the most urgent
-    agent in their branch, then their own status and pane, so one blocked agent is not listed below every
-    other crew's rows; roots, and trees without a second mate, keep the order of rows."""
+    urgency, though each row still names its own workspace. In the workspace that lists such a tree, every
+    branch, top-level ones included, goes by the most urgent agent in it, then its own status and pane, so a
+    blocked agent is not listed below another crew's rows; the other workspaces keep the order of rows."""
     pos = {ws: n for n, ws in enumerate(spaces)}
     rank = lambda r: ORDER.get(r["status"], len(ORDER))
-    path, home, branch = [], {}, {}
+    path, home = [], {}
     for r in tree_order(rows):  # the trees across workspaces; the pass per workspace below redraws PANE
         path[r["depth"]:] = [r]
         home[r["pane"]] = path[0]
-        for up in path:  # r counts for its own branch and for each row it is listed under
-            branch[up["pane"]] = min(branch.get(up["pane"], len(ORDER)), rank(r))
     mated = {home[r["pane"]]["pane"] for r in rows if r.get("mate")}
     groups = {}
     for r in rows:
         top = home[r["pane"]]
         groups.setdefault(top["ws"] if top["pane"] in mated else r["ws"], []).append(r)
     urgent = {ws: min(map(rank, rs)) for ws, rs in groups.items()}
+    mixed = {r["ws"] for r in rows if r["pane"] in mated}
 
-    def lift(r):  # a sort key: sorted() is stable and rows come by status, then pane, so ties keep that order
-        top = home[r["pane"]]
-        return branch[r["pane"]] if top is not r and top["pane"] in mated else rank(r)
+    def by_branch(rs):  # sorted() is stable and rows come by status, then pane, so ties keep that order
+        path, best = [], {}
+        for r in tree_order(rs):  # within the group: a worker listed in another workspace does not count
+            path[r["depth"]:] = [r]
+            for up in path:  # r counts for its own branch and for each row it is listed under
+                best[up["pane"]] = min(best.get(up["pane"], len(ORDER)), rank(r))
+        return sorted(rs, key=lambda r: best[r["pane"]])
 
     return [r for ws in sorted(groups, key=lambda ws: (urgent[ws], pos.get(ws, len(pos)), pane_key(ws)))
-            for r in tree_order(sorted(groups[ws], key=lift))]
+            for r in tree_order(by_branch(groups[ws]) if ws in mixed else groups[ws])]
 
 
 def tree_order(rows):

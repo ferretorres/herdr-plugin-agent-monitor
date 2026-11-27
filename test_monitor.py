@@ -479,6 +479,28 @@ assert mated(snap=ODD_MATES) == [("w5:p1", 0), ("w5:p2", 0), ("w5:p3", 0), ("w5:
 odd_rows = {r["pane"]: r for r in monitor.build_rows(ODD_MATES, screens=False)}
 odd_crew = [crew_line(odd_rows, p) for p in ("w5:p1", "w5:p2", "w5:p4", "w6:p1", "w7:p1", "w8:p1")]
 assert odd_crew == [f"{c} · lead" for c in ("one", "two", "three", "five", "six", "seven")], odd_crew
+# In the workspace that lists a first mate's tree, every branch goes by its most urgent agent, top-level ones
+# included. Idle first mate w1:p5, whose second mate's worker w2:p2 is blocked, comes before the working agent
+# w1:p1 and the working crew ops there; when ops' worker w1:p4 is the blocked one, ops comes first instead.
+SHARED = {"agents": [agent("w1:p1", status="working"), agent("w1:p5", tokens=member("alpha", "lead")),
+                     agent("w1:p2", status="working", tokens=member("ops", "lead")),
+                     agent("w1:p3", status="working", tokens=member("ops", lead="w1:p2")),
+                     agent("w1:p4", status="working", tokens=member("ops", lead="w1:p2")),
+                     agent("w2:p1", tokens=member("beta", "lead", mate_of="w1:p5")),
+                     agent("w2:p2", status="blocked", tokens=member("beta", lead="w2:p1"))]}
+assert mated(snap=SHARED) == [("w1:p5", 0), ("w2:p1", 1), ("w2:p2", 2), ("w1:p1", 0), ("w1:p2", 0), ("w1:p3", 1),
+                              ("w1:p4", 1)], mated(snap=SHARED)
+OPS_BLOCKED = {"agents": [dict(a, agent_status={"w1:p4": "blocked", "w2:p2": "idle"}.get(a["pane_id"], a["agent_status"]))
+                          for a in SHARED["agents"]]}
+assert mated(snap=OPS_BLOCKED) == [("w1:p2", 0), ("w1:p4", 1), ("w1:p3", 1), ("w1:p1", 0), ("w1:p5", 0), ("w2:p1", 1),
+                                   ("w2:p2", 2)], mated(snap=OPS_BLOCKED)
+# A first mate's own worker in another workspace is listed under it as well, and a chain of links nests one level
+# per link (the crew kit makes no such chain, but the table copes with one).
+AWAY = {"agents": [agent("w1:p1", tokens=member("alpha", "lead")), agent("w4:p1", tokens=member("alpha", lead="w1:p1")),
+                   agent("w2:p1", tokens=member("beta", "lead", mate_of="w1:p1")),
+                   agent("w3:p1", tokens=member("gamma", "lead", mate_of="w2:p1"))]}
+assert mated(snap=AWAY) == [("w1:p1", 0), ("w2:p1", 1), ("w3:p1", 2), ("w4:p1", 1)], mated(snap=AWAY)
+assert mated(["w4"], snap=AWAY) == [("w4:p1", 0)], mated(["w4"], snap=AWAY)
 # The hook still reads only the pane that changed: a second mate's row alone, a root.
 saved_herdr, real_publish, published = monitor.HERDR, monitor.publish, []
 monitor.HERDR = fake_herdr({"api snapshot": (0, json.dumps({"result": {"snapshot": MATES}}))})

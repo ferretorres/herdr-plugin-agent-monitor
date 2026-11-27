@@ -156,8 +156,8 @@ workspace, not shown or gone is listed at the top level of its own workspace, ex
 A second mate is the lead of its own crew, usually in another workspace, linked to a first mate (an ordinary
 lead). When both are shown, the first mate's whole tree (its workers, its second mates and their workers) is
 listed in the first mate's workspace; WORKSPACE still names each row's own workspace. A blocked agent anywhere
-in that tree moves the workspace up, and at each level of the tree the branch with the most urgent agent comes
-first, so a blocked agent is listed near the top of the tree, not after the other crews. A second mate whose
+in that tree moves the workspace up, and in that workspace every branch, top-level ones included, goes by the
+most urgent agent in it, so a blocked agent is listed near the top, not after the other crews. A second mate whose
 first mate is not shown is listed at the top level of its own workspace, with its workers under it. A lead
 whose `crew_mate_of` names itself, a pane that is not a lead, or a loop of links stays at the top level. Its
 CREW line names the link only when the row is nested under that first mate, or when the linked pane is not in
