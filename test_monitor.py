@@ -415,8 +415,8 @@ def member(crew, role="worker", lead=None, mate_of=None):
 
 # alpha's lead w1:p2 is the first mate; beta (w2) and gamma (w3) are its second mates, each with a worker.
 # Its whole tree is listed in w1's group and beta's blocked worker counts there, so that group comes first,
-# though the sidebar has w2 first and w2:p3, outside any crew, is working. w2:p3 and w3:p3 stay in their own
-# workspaces' groups.
+# though the sidebar has w2 first and w2:p3, outside any crew, is working; in the tree, beta's branch comes
+# first. w2:p3 and w3:p3 stay in their own workspaces' groups.
 MATES = {"workspaces": [{"workspace_id": "w2", "label": "web"}, {"workspace_id": "w1", "label": "api"},
                         {"workspace_id": "w3", "label": "docs"}],
          "agents": [agent("w1:p2", "claude", tokens=member("alpha", "lead")),
@@ -428,13 +428,13 @@ MATES = {"workspaces": [{"workspace_id": "w2", "label": "web"}, {"workspace_id":
                     agent("w3:p2", tokens=member("gamma", lead="w3:p1")), agent("w3:p3")]}
 mated = lambda ws=None, snap=MATES: [(r["pane"], r["depth"]) for r in monitor.build_rows(snap, ws, screens=False)]
 by_pane = lambda ws=None: {r["pane"]: r for r in monitor.build_rows(MATES, ws, screens=False)}
-assert mated() == [("w1:p2", 0), ("w1:p3", 1), ("w2:p1", 1), ("w2:p2", 2), ("w3:p1", 1), ("w3:p2", 2),
+assert mated() == [("w1:p2", 0), ("w2:p1", 1), ("w2:p2", 2), ("w1:p3", 1), ("w3:p1", 1), ("w3:p2", 2),
                    ("w2:p3", 0), ("w3:p3", 0)], mated()
 rows = by_pane()
 assert rows["w2:p1"]["parent"] == rows["w3:p1"]["parent"] == "w1:p2" and rows["w1:p2"]["parent"] is None
 assert [rows[p]["cells"]["WORKSPACE"] for p in ("w1:p2", "w2:p1", "w2:p2", "w3:p1")] == ["api", "web", "web", "docs"]
 assert rows["w2:p1"]["cells"]["PANE"] == "└ w2:p1" and rows["w2:p2"]["cells"]["PANE"] == "  └ w2:p2"
-assert mated(["w1", "w2"]) == [("w1:p2", 0), ("w1:p3", 1), ("w2:p1", 1), ("w2:p2", 2), ("w2:p3", 0)], mated(["w1", "w2"])
+assert mated(["w1", "w2"]) == [("w1:p2", 0), ("w2:p1", 1), ("w2:p2", 2), ("w1:p3", 1), ("w2:p3", 0)], mated(["w1", "w2"])
 # The details panel's CREW line names the link; a first mate counts the second mates shown.
 crew_line = lambda rows, pane: dict(rows[pane]["full"])["CREW"]
 assert crew_line(rows, "w2:p1") == "beta · lead · second mate of w1:p2", crew_line(rows, "w2:p1")
@@ -442,10 +442,27 @@ assert crew_line(rows, "w1:p2") == "alpha · lead · first mate of 2 second mate
 assert crew_line(rows, "w3:p2") == "gamma · worker · lead w3:p1"
 assert crew_line(by_pane(["w1", "w2"]), "w1:p2") == "alpha · lead · first mate of 1 second mate"
 assert crew_line(by_pane(["w1"]), "w1:p2") == "alpha · lead"
-# Without its first mate, a second mate heads its own workspace's rows, as before; its CREW line still names it.
+# Without its first mate, a second mate is a root of its own workspace, as before; its CREW line still names it.
 assert mated(["w2"]) == [("w2:p3", 0), ("w2:p1", 0), ("w2:p2", 1)], mated(["w2"])
 assert mated(["w3", "w2"]) == [("w2:p3", 0), ("w2:p1", 0), ("w2:p2", 1), ("w3:p1", 0), ("w3:p2", 1), ("w3:p3", 0)]
 assert crew_line(by_pane(["w2"]), "w2:p1") == "beta · lead · second mate of w1:p2"
+# The crew kit's shape: first mate w1:p1 with four workers, second mates w2:p1..w6:p1 with three each; w2:p1 is
+# working and w6's worker w6:p4 is blocked. In a first mate's tree the branch with the most urgent agent comes
+# first among its siblings, so w6:p4 is the third row, not the 23rd, and a working second mate's crew does not
+# push it down. w7's crew has no mates and keeps its order: w7:p4, blocked, is w7:p3's worker, after w7:p2.
+KIT = {"agents": [agent("w1:p1", tokens=member("alpha", "lead"))]
+       + [agent(f"w1:p{i}", tokens=member("alpha", lead="w1:p1")) for i in range(2, 6)]
+       + [agent(f"w{w}:p{i}", status={(2, 1): "working", (6, 4): "blocked"}.get((w, i), "idle"),
+                tokens=member(f"c{w}", lead=f"w{w}:p1") if i > 1 else member(f"c{w}", "lead", mate_of="w1:p1"))
+          for w in range(2, 7) for i in range(1, 5)]
+       + [agent("w7:p1", tokens=member("solo", "lead")), agent("w7:p2", tokens=member("solo", lead="w7:p1")),
+          agent("w7:p3", tokens=member("solo", lead="w7:p1")),
+          agent("w7:p4", status="blocked", tokens=member("solo", lead="w7:p3"))]}
+kit = mated(snap=KIT)
+assert kit[:5] == [("w1:p1", 0), ("w6:p1", 1), ("w6:p4", 2), ("w6:p2", 2), ("w6:p3", 2)], kit
+assert [p for p, d in kit[:25] if d == 1] == ["w6:p1", "w2:p1", "w1:p2", "w1:p3", "w1:p4", "w1:p5", "w3:p1",
+                                               "w4:p1", "w5:p1"], kit
+assert kit[25:] == [("w7:p1", 0), ("w7:p2", 1), ("w7:p3", 1), ("w7:p4", 2)], kit
 # A crew_mate_of naming its own lead, a pane that is not a lead (an agent outside a crew, a worker) or a lead
 # whose links come back around leaves that lead a root: every row is listed once and nothing loops.
 ODD_MATES = {"agents": [agent("w5:p1", tokens=member("one", "lead", mate_of="w5:p1")),
@@ -458,6 +475,10 @@ ODD_MATES = {"agents": [agent("w5:p1", tokens=member("one", "lead", mate_of="w5:
                         agent("w8:p1", tokens=member("seven", "lead", mate_of="w6:p1"))]}
 assert mated(snap=ODD_MATES) == [("w5:p1", 0), ("w5:p2", 0), ("w5:p3", 0), ("w5:p4", 0), ("w5:p6", 0), ("w5:p5", 1),
                                  ("w6:p1", 0), ("w7:p1", 0), ("w7:p2", 1), ("w8:p1", 0)], mated(snap=ODD_MATES)
+# Their CREW lines name no link the table did not draw: to themselves, to a pane that is not a lead, into a loop.
+odd_rows = {r["pane"]: r for r in monitor.build_rows(ODD_MATES, screens=False)}
+odd_crew = [crew_line(odd_rows, p) for p in ("w5:p1", "w5:p2", "w5:p4", "w6:p1", "w7:p1", "w8:p1")]
+assert odd_crew == [f"{c} · lead" for c in ("one", "two", "three", "five", "six", "seven")], odd_crew
 # The hook still reads only the pane that changed: a second mate's row alone, a root.
 saved_herdr, real_publish, published = monitor.HERDR, monitor.publish, []
 monitor.HERDR = fake_herdr({"api snapshot": (0, json.dumps({"result": {"snapshot": MATES}}))})
