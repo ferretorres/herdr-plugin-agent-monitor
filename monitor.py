@@ -922,6 +922,8 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
         first = firsts.get(a["pane_id"])
         mate_of = _s(tokens.get("crew_mate_of")) if role == "lead" else ""
+        if mate_of in found and not first:  # found keys every shown pane; a link to one is named only if drawn
+            mate_of = ""
         n = sum(f == a["pane_id"] for f in firsts.values())
         links = (lead and f"lead {lead}", mate_of and f"second mate of {mate_of}",
                  n and f"first mate of {n} second mate" + ("" if n == 1 else "s"))
@@ -1002,26 +1004,36 @@ def space_order(rows, spaces):
     then in snapshot (sidebar) order, then workspaces the snapshot does not list, by id; each workspace's
     rows in tree_order, so a worker whose lead is elsewhere is a root. A first mate's whole tree (its
     workers, its second mates and theirs) is listed in the first mate's workspace and counts for its
-    urgency, though each row still names its own workspace."""
+    urgency, though each row still names its own workspace. In that tree, siblings go by the most urgent
+    agent in their branch, then their own status and pane, so one blocked agent is not listed below every
+    other crew's rows; roots, and trees without a second mate, keep the order of rows."""
     pos = {ws: n for n, ws in enumerate(spaces)}
-    top, home = None, {}
+    rank = lambda r: ORDER.get(r["status"], len(ORDER))
+    path, home, branch = [], {}, {}
     for r in tree_order(rows):  # the trees across workspaces; the pass per workspace below redraws PANE
-        top = r if r["depth"] == 0 else top
-        home[r["pane"]] = top
+        path[r["depth"]:] = [r]
+        home[r["pane"]] = path[0]
+        for up in path:  # r counts for its own branch and for each row it is listed under
+            branch[up["pane"]] = min(branch.get(up["pane"], len(ORDER)), rank(r))
     mated = {home[r["pane"]]["pane"] for r in rows if r.get("mate")}
     groups = {}
     for r in rows:
         top = home[r["pane"]]
         groups.setdefault(top["ws"] if top["pane"] in mated else r["ws"], []).append(r)
-    urgent = {ws: min(ORDER.get(r["status"], len(ORDER)) for r in rs) for ws, rs in groups.items()}
+    urgent = {ws: min(map(rank, rs)) for ws, rs in groups.items()}
+
+    def lift(r):  # a sort key: sorted() is stable and rows come by status, then pane, so ties keep that order
+        top = home[r["pane"]]
+        return branch[r["pane"]] if top is not r and top["pane"] in mated else rank(r)
+
     return [r for ws in sorted(groups, key=lambda ws: (urgent[ws], pos.get(ws, len(pos)), pane_key(ws)))
-            for r in tree_order(groups[ws])]
+            for r in tree_order(sorted(groups[ws], key=lift))]
 
 
 def tree_order(rows):
     """Each lead followed by its workers (crew_lead token = the lead's pane id) and its second mates
-    (first_mates), depth-first, indented with └ in PANE. A worker whose lead is not shown is a root;
-    cycles are cut."""
+    (first_mates), depth-first, indented with └ in PANE; siblings keep their order in rows. A worker whose
+    lead is not shown is a root; cycles are cut."""
     shown = {r["pane"] for r in rows}
     kids = {}
     for r in rows:
