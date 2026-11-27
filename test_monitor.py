@@ -142,6 +142,19 @@ assert rows["w1:p1"]["space"] == "teal"     # the agent's own token
 assert rows["w1:p2"]["space"] == "pink"     # else the pane's token
 assert rows["w2:p1"]["space"] is None      # no token anywhere: no colour
 assert monitor.sc_palette({"x": "1"}, {"sc_my-own": "●"}) == "my-own" and monitor.sc_palette({}) is None
+
+# WORKSPACE, right after ST in both views: the workspace's label, coloured with its own palette.
+assert all([c[0] for c in monitor.VIEWS[v]][:3] == ["ST", "WORKSPACE", "PANE"] for v in monitor.VIEWS)
+assert rows["w1:p1"]["cells"]["WORKSPACE"] == "one" and rows["w2:p1"]["cells"]["WORKSPACE"] == "two"
+CS = {"space": {"red": 101, "teal": 102, "pink": 103}}
+assert monitor.cell_attr(CS, rows["w1:p1"], "PANE") == 102            # the agent's own colour
+assert monitor.cell_attr(CS, rows["w1:p1"], "WORKSPACE") == 101       # its workspace's colour
+assert monitor.cell_attr(CS, rows["w1:p2"], "WORKSPACE") == 101 and monitor.cell_attr(CS, rows["w2:p1"], "WORKSPACE") == 0
+bare = {"agents": [agent("w5:p1", tokens={"sc_teal": "●"}), agent("w6:p1")], "workspaces": [{"workspace_id": "w5"}]}
+cells = {r["pane"]: r for r in monitor.build_rows(bare, screens=False)}
+assert cells["w5:p1"]["cells"]["WORKSPACE"] == "w5" and cells["w6:p1"]["cells"]["WORKSPACE"] == "w6"   # no label: the id
+assert monitor.cell_attr(CS, cells["w5:p1"], "WORKSPACE") == 102      # a workspace without a palette: the row's
+assert monitor.frame(list(rows.values()), monitor.VIEWS["activity"], 200)[0].startswith("ST WORKSPACE  PANE    AGENT")
 print("ok")
 
 # --- AGENT_MONITOR_SCOPE -------------------------------------------------------------------------
@@ -162,9 +175,9 @@ CURRENT = json.dumps({"id": "c", "result": {"type": "pane_info", "pane": {"pane_
 here = fake_herdr({"pane current": (0, CURRENT)})
 broken = fake_herdr({"pane current": (1, NOT_RUNNING)})
 assert monitor.scope_workspace() is None                       # unset = all
-assert scoped("all", here) is None and scoped("w7", here) == "w7"
-assert scoped("workspace", here, ws_env="w1") == "w2"          # live workspace wins over the launch env
-assert scoped("workspace", broken, ws_env="w1") == "w1"        # fallback: HERDR_WORKSPACE_ID
+assert scoped("all", here) is None and scoped("w7", here) == ["w7"]
+assert scoped("workspace", here, ws_env="w1") == ["w2"]        # live workspace wins over the launch env
+assert scoped("workspace", broken, ws_env="w1") == ["w1"]      # fallback: HERDR_WORKSPACE_ID
 assert scoped("workspace", broken) is None                     # nothing known: all
 rows = monitor.build_rows(SNAP, "w1")
 assert sorted(r["pane"] for r in rows) == ["w1:p1", "w1:p2"]
@@ -173,9 +186,194 @@ assert monitor.scope_label(None, SNAP) == "all workspaces" and "not found" in mo
 os.environ["AGENT_MONITOR_SCOPE"] = "workspace"
 monitor.HERDR = fake_herdr({"pane current": (0, CURRENT), "agent read": (0, ""),
                             "api snapshot": (0, json.dumps({"result": {"snapshot": SNAP}}))})
-rows, label = monitor.collect()
+rows, label = monitor.collect()[:2]
 assert [r["pane"] for r in rows] == ["w2:p1"] and label == "workspace two (w2)", (rows, label)
 os.environ.pop("AGENT_MONITOR_SCOPE")
+print("ok")
+
+# --- the workspace filter: ALL or an explicit set; without a choice, AGENT_MONITOR_SCOPE ----------
+P = monitor.parse_scope
+assert P(None) is None and P("") is None and P(" all ") is None and P(" workspace ") == "workspace"
+assert P("w2") == ["w2"] and P(" w1 , w3 ,w1,") == ["w1", "w3"] and P(",") is None
+assert scoped("w1,w9", here) == ["w1", "w9"]                   # an unknown id stays, for the title to flag
+R = monitor.resolve_scope
+assert R(None, SNAP, lambda: ["w2"]) == ["w2"]                 # no choice: AGENT_MONITOR_SCOPE
+assert R("all", SNAP, lambda: ["w2"]) is None                  # ALL
+assert R(["w2", "w1"], SNAP, lambda: None) == ["w1", "w2"]     # snapshot order
+assert R(["w9", "w2"], SNAP, lambda: None) == ["w2"]           # a workspace that vanished is dropped
+assert R(["w9"], SNAP, lambda: ["w2"]) == ["w2"]               # none left: AGENT_MONITOR_SCOPE again
+assert R(["w9"], SNAP, lambda: None) is None
+assert sorted(r["pane"] for r in monitor.build_rows(SNAP, ["w1", "w2"])) == ["w1:p1", "w1:p2", "w2:p1"]
+assert monitor.build_rows(SNAP, ["w9"]) == [] and [r["pane"] for r in monitor.build_rows(SNAP, ["w2"])] == ["w2:p1"]
+odd_ws = {"agents": [agent("w1:p1", workspace_id={"x": 1}), agent("w1:p2", workspace_id=None), agent("w1:p3")],
+          "workspaces": [{"workspace_id": ["x"]}, "junk", {"workspace_id": "w1", "label": "one"}]}
+assert [r["pane"] for r in monitor.build_rows(odd_ws, ["w1"], screens=False)] == ["w1:p3"]   # odd ids never raise
+assert len(monitor.build_rows(odd_ws, screens=False)) == 3
+
+# The refresh applies the picker's choice; a choice needs no `pane current`, a stale one falls back.
+SNAP_HERDR = fake_herdr({"pane current": (0, CURRENT), "agent read": (0, ""),
+                         "api snapshot": (0, json.dumps({"result": {"snapshot": SNAP}}))})
+monitor.HERDR = SNAP_HERDR
+os.environ["AGENT_MONITOR_SCOPE"] = "workspace"
+calls = []
+monitor.herdr = lambda *a, **k: (calls.append(a[:2]), real(*a, **k))[1]
+rows, label, shown, spaces = monitor.collect(choice=["w1"])
+assert sorted(r["pane"] for r in rows) == ["w1:p1", "w1:p2"] and shown == ["w1"] and label == "workspace one (w1)"
+assert ("pane", "current") not in calls, calls
+rows, label, shown, spaces = monitor.collect(choice=["w9"])
+assert [r["pane"] for r in rows] == ["w2:p1"] and shown == ["w2"] and ("pane", "current") in calls
+rows, label, shown, spaces = monitor.collect(choice="all")
+assert len(rows) == 3 and (label, shown) == ("all workspaces", None)
+# every workspace on the server, in sidebar order, with its live agent count: what the picker lists
+assert spaces == [{"id": "w1", "label": "one", "agents": 2}, {"id": "w2", "label": "two", "agents": 1}], spaces
+assert monitor.workspace_counts({"workspaces": [{"workspace_id": "w3"}, "junk", {"label": "no id"}],
+                                 "agents": [agent("w3:p1"), "junk", {"workspace_id": "w3"}]}) \
+    == [{"id": "w3", "label": "", "agents": 1}]
+monitor.herdr = real
+os.environ["AGENT_MONITOR_SCOPE"] = "w2,w9"                    # an env list, one id unknown
+rows, label, shown, spaces = monitor.collect()
+assert [r["pane"] for r in rows] == ["w2:p1"] and shown == ["w2", "w9"], (rows, shown)
+assert label == "2 workspaces: two, w9 (not found)", label
+os.environ.pop("AGENT_MONITOR_SCOPE")
+
+# Title: one workspace as before, a set as "N workspaces: A, B" in sidebar order, ALL as before.
+L = monitor.scope_label
+assert L(["w1"], SNAP) == "workspace one (w1)" and L(None, SNAP) == "all workspaces"
+assert L(["w2", "w1"], SNAP) == "2 workspaces: one, two" and L(["w9"], SNAP) == "workspace w9 (not found)"
+assert L(["w1", "w5"], dict(SNAP, workspaces=SNAP["workspaces"] + [{"workspace_id": "w5"}])) == "2 workspaces: one, w5"
+T = monitor.title_text
+assert T("all workspaces", 3, 80) == "agent monitor · all workspaces · 3 agents"
+t = T("3 workspaces: alpha-project, beta-project, gamma-project", 12, 50)
+assert len(t) == 50 and t.startswith("agent monitor · 3 workspaces: al") and t.endswith("… · 12 agents"), t
+assert T("workspace one (w1)", 1, 5).endswith(" · 1 agents") and T("", 0, 0)   # too narrow: cut by the caller
+# Agents past 90% context: the alert ends the title, and the scope is cut first so it still shows.
+assert monitor.ctx_alert([{"pct": 95.0}, {"pct": None}, {"pct": 89.9}, {"pct": 90}]) == " · 2 context ≥90%"
+assert monitor.ctx_alert([{"pct": None}]) == "" and monitor.ctx_alert([]) == ""
+alert = monitor.ctx_alert([{"pct": 95.0}])
+t = T("4 workspaces: alpha-project, beta-project, gamma-project, delta-project", 12, 80, alert)
+assert len(t) == 80 and t.endswith("… · 12 agents · 1 context ≥90%"), t
+assert T("all workspaces", 3, 80, alert) == "agent monitor · all workspaces · 3 agents · 1 context ≥90%"
+print("ok")
+
+# --- the w picker: All workspaces, then each workspace; [x] = shown ---------------------------------
+SPACES = monitor.workspace_counts(SNAP)
+step, lines = monitor.picker_step, monitor.picker_lines
+p = monitor.picker_open(["w1"], SPACES)                          # opens on what the monitor shows now
+assert lines(p) == ["[ ] All workspaces", "[x] one  w1  2 agents", "[ ] two  w2  1 agent"], lines(p)
+p, applied = step(p, "up")
+assert p["at"] == 0 and applied is None                          # the first line is the top
+for _ in range(5):
+    p, _ = step(p, "down")
+assert p["at"] == 2                                              # and the last one the bottom
+p, _ = step(p, "toggle")
+assert lines(p)[1:] == ["[x] one  w1  2 agents", "[x] two  w2  1 agent"]
+assert step(p, "apply") == (None, ["w1", "w2"])                  # applied in sidebar order
+p, _ = step(p, "toggle")
+assert step(p, "apply") == (None, None)                          # back as it opened: nothing to apply
+p, _ = step(p, "up")
+p, _ = step(p, "toggle")                                         # one off: nothing selected
+held, applied = step(p, "apply")
+assert applied is None and held is not None and held["hint"]     # Enter keeps the picker open, with a hint
+p, _ = step(held, "all")                                         # a: every workspace, and later ones
+assert all(l.startswith("[x]") for l in lines(p)) and not p["hint"]
+assert step(p, "apply") == (None, "all")
+p = monitor.picker_open(["w2"], SPACES)
+p, _ = step(p, "toggle")                                         # space on All workspaces: all on
+assert p["all"] and lines(p)[0] == "[x] All workspaces"
+p, _ = step(p, "toggle")                                         # and all off
+assert lines(p) == ["[ ] All workspaces", "[ ] one  w1  2 agents", "[ ] two  w2  1 agent"]
+assert step(p, "apply")[0]["hint"]
+p = monitor.picker_open(None, SPACES)                            # opened on ALL
+p, _ = step(p, "down")
+p, _ = step(p, "toggle")                                         # unticking one keeps the others
+assert lines(p)[:2] == ["[ ] All workspaces", "[ ] one  w1  2 agents"] and step(p, "apply") == (None, ["w2"])
+assert step(monitor.picker_open(None, SPACES), "close") == (None, None)
+assert step(monitor.picker_open(["w2", "w9"], SPACES), "apply") == (None, None)   # w9 is not listed
+p = monitor.picker_open(["w9"], SPACES)                          # a workspace that vanished is no selection
+assert step(p, "apply")[1] is None and step(p, "apply")[0]["hint"]
+p, _ = step(dict(p, at=9), "toggle")                             # a cursor past the end stops there
+assert p["at"] == 2 and step(p, "apply") == (None, ["w2"])
+assert lines(monitor.picker_open(None, [])) == ["[x] All workspaces"]
+assert lines(monitor.picker_open(None, [{"id": "w3", "label": "", "agents": 0}]))[1] == "[x]   w3  0 agents"
+# It opens on the choice in force, which applies before a refresh shows it: ALL, or its ids that are
+# listed; with none of them listed, on what is shown.
+assert lines(monitor.picker_open(["w1"], SPACES, "all"))[0] == "[x] All workspaces"
+assert lines(monitor.picker_open(["w1"], SPACES, ["w2", "w9"]))[1:] == ["[ ] one  w1  2 agents", "[x] two  w2  1 agent"]
+assert step(monitor.picker_open(["w1"], SPACES, ["w2"]), "apply") == (None, None)   # Enter: no change
+assert lines(monitor.picker_open(["w1"], SPACES, ["w9"]))[1] == "[x] one  w1  2 agents"
+assert lines(monitor.picker_open(None, SPACES, ["w9"]))[0] == "[x] All workspaces"
+# It lists the workspaces it opened with, whatever happens to the list it was given.
+listed = list(SPACES)
+p = monitor.picker_open(["w1"], listed)
+listed.pop(0)
+assert len(lines(p)) == 3 and step(step(p, "down")[0], "toggle")[0]["ids"] == set()
+print("ok")
+
+# --- unchanged around the filter: --once, the hook, what the open monitor publishes ------------------
+monitor.HERDR = SNAP_HERDR
+os.environ["HERDR_PLUGIN_STATE_DIR"] = tempfile.mkdtemp()
+pane_env = os.environ.pop("HERDR_PANE_ID", None)
+os.environ["HERDR_PANE_ID"] = "w1:p9"
+assert monitor.save_choice("w1:p9", ["w2"])                     # a monitor in this pane chose w2
+os.environ["AGENT_MONITOR_SCOPE"] = "w1,w2"
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    assert monitor.once(["--once"]) == 0
+printed = out.getvalue().splitlines()
+assert printed[0] == "agent monitor · 2 workspaces: one, two · 3 agents", printed[0]   # the env list, not the choice
+assert printed[1].startswith("ST WORKSPACE  PANE") and [l.split()[1] for l in printed[2:]] == ["one", "one", "two"]
+os.environ.pop("AGENT_MONITOR_SCOPE")
+published = []
+real_publish = monitor.publish
+monitor.publish = lambda rows: published.append([r["pane"] for r in rows])
+os.environ["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({"data": {"pane_id": "w2:p1"}})
+assert monitor.hook() == 0 and published == [["w2:p1"]], published   # the hook: only the pane that changed
+del os.environ["HERDR_PLUGIN_EVENT_JSON"]
+state = {"data": ([], ""), "choice": "all"}
+monitor.refresh_once(state)                                     # the open monitor: the rows it shows
+assert published[-1] == [r["pane"] for r in state["data"][0]] == ["w1:p1", "w1:p2", "w2:p1"], published
+state["choice"] = ["w2"]
+monitor.refresh_once(state)
+assert published[-1] == ["w2:p1"] and (state["shown"], state["scope"]) == (["w2"], "workspace two (w2)")
+# A saved id whose workspace is missing from two refreshes in a row is dropped and the rest saved, so a
+# new workspace that herdr later gives that id is not shown by the old choice.
+# The refresh thread only marks them; the UI thread, the one writer of the choice, takes them out.
+state = {"data": ([], ""), "choice": ["w2", "w7"], "pane": "w1:p9", "env": None}
+monitor.refresh_once(state)
+assert not monitor.apply_drop(state) and state["choice"] == ["w2", "w7"]    # missing once: kept
+monitor.refresh_once(state)
+assert state["choice"] == ["w2", "w7"] and state["drop"] == {"w7"}           # marked, not changed
+assert monitor.apply_drop(state) and state["choice"] == ["w2"] and monitor.load_choice("w1:p9") == ["w2"]
+assert not monitor.apply_drop(state)                                         # taken once
+state = {"data": ([], ""), "choice": ["w7"], "pane": "w1:p9", "env": None}
+monitor.refresh_once(state)
+monitor.refresh_once(state)
+assert monitor.apply_drop(state) and state["choice"] is None and monitor.load_choice("w1:p9") is None
+state = {"data": ([], ""), "choice": ["w7"], "pane": "w1:p9", "env": None}  # back before the second refresh
+monitor.refresh_once(state)
+state["choice"] = "all"                                                      # the user picked all meanwhile
+monitor.refresh_once(state)
+assert not monitor.apply_drop(state) and state["choice"] == "all"
+monitor.publish = real_publish
+# Two monitors that both show an agent past 90% context send its toast once: the claim is a file.
+TWO = ("import sys, monitor\n"
+       "monitor.herdr = lambda *a, **k: ''\n"
+       "def show(*a):\n"
+       "    open(sys.argv[1], 'a').write('toast\\n')\n"
+       "    return {'shown': True}\n"
+       "monitor.herdr_json = show\n"
+       "monitor.publish([{'pane': 'w1:p1', 'agent': 'claude', 'session': '/t.jsonl', 'place': 'w1:p1',\n"
+       "                  'cells': {'AGENT': 'lead'}, 'pct': 95.0, 'usd': None, 'tokens': {}, 'labels': {}}])\n")
+toasts = os.path.join(os.environ["HERDR_PLUGIN_STATE_DIR"], "toasts.log")
+two = [subprocess.Popen([sys.executable, "-c", TWO, toasts], cwd=os.path.dirname(os.path.abspath(__file__)))
+       for _ in range(2)]
+assert [p.wait(30) for p in two] == [0, 0]
+with open(toasts) as f:
+    assert f.read() == "toast\n"
+os.environ.pop("HERDR_PANE_ID")
+if pane_env:
+    os.environ["HERDR_PANE_ID"] = pane_env
+del os.environ["HERDR_PLUGIN_STATE_DIR"]
 print("ok")
 
 # --- crew hierarchy, agent name, title ------------------------------------------------------------
@@ -194,7 +392,8 @@ CREW = {"agents": [agent("w1:p4", tokens=crew("worker", "w1:p2"), name="alpha-te
         "panes": [], "workspaces": []}
 rows = monitor.build_rows(CREW)
 order = [(r["pane"], r["depth"]) for r in rows]
-assert order[:5] == [("w1:p2", 0), ("w1:p3", 1), ("w1:p4", 1), ("w1:p5", 2), ("w2:p1", 1)], order
+# w2:p1's lead is in w1: rows go by workspace, so it heads its own workspace's rows
+assert order[:5] == [("w1:p2", 0), ("w1:p3", 1), ("w1:p4", 1), ("w1:p5", 2), ("w2:p1", 0)], order
 assert order[5:] == [("w3:p1", 0), ("w3:p2", 1)], order    # a lead cycle is cut, every row shown once
 cells = {r["pane"]: r["cells"] for r in rows}
 assert cells["w1:p3"]["PANE"] == "└ w1:p3" and cells["w1:p5"]["PANE"] == "  └ w1:p5"
@@ -234,9 +433,28 @@ os.environ.pop("CODEX_HOME")
 
 ids = ["w10:p1", "w2:p10", "w2:p9", "w1:p1"]
 assert sorted(ids, key=monitor.pane_key) == ["w1:p1", "w2:p9", "w2:p10", "w10:p1"]
-rows = monitor.build_rows({"agents": [agent("w10:p1"), agent("w2:p1"), agent("w1:p1", status="unknown")]})
-assert [r["pane"] for r in rows] == ["w2:p1", "w10:p1", "w1:p1"]    # unknown sorts last
+rows = monitor.build_rows({"agents": [agent("w1:p10"), agent("w1:p2"), agent("w1:p1", status="unknown")]})
+assert [r["pane"] for r in rows] == ["w1:p2", "w1:p10", "w1:p1"]    # unknown sorts last
 assert rows[-1]["cells"]["ST"] == "◌"
+# Rows go by workspace, the one with the most urgent agent first (blocked, working, idle...), then in
+# sidebar order (the ones the snapshot does not list after, by id); inside each workspace by status and
+# the crew tree. So w1's blocked agent puts w1 ahead of w2, and blocked agents stay at the top.
+ORDERED = {"workspaces": [{"workspace_id": "w2", "label": "two"}, {"workspace_id": "w1", "label": "one"}],
+           "agents": [agent("w1:p1", status="blocked"), agent("w10:p1"), agent("w3:p1"),
+                      agent("w2:p3", tokens={"crew_role": "worker", "crew_lead": "w2:p2"}),
+                      agent("w2:p2", tokens={"crew_role": "lead"}), agent("w2:p1", status="working")]}
+rows = monitor.build_rows(ORDERED, screens=False)
+assert [(r["pane"], r["depth"]) for r in rows] == [("w1:p1", 0), ("w2:p1", 0), ("w2:p2", 0), ("w2:p3", 1),
+                                                   ("w3:p1", 0), ("w10:p1", 0)], [(r["pane"], r["depth"]) for r in rows]
+assert [r["pane"] for r in monitor.build_rows(ORDERED, ["w1", "w2"], screens=False)] == ["w1:p1", "w2:p1", "w2:p2", "w2:p3"]
+assert [r["pane"] for r in monitor.build_rows(ORDERED, ["w2"], screens=False)] == ["w2:p1", "w2:p2", "w2:p3"]
+CALM = dict(ORDERED, agents=[agent("w1:p1"), agent("w2:p1")])     # equally urgent: sidebar order
+# A workspace label is free text: it is shown on one line.
+ODD = {"workspaces": [{"workspace_id": "w1", "label": "two\nlines  here"}], "agents": [agent("w1:p1")]}
+assert monitor.build_rows(ODD, screens=False)[0]["cells"]["WORKSPACE"] == "two lines here"
+assert monitor.workspace_counts(ODD)[0]["label"] == "two lines here"
+assert monitor.scope_label(["w1"], ODD) == "workspace two lines here (w1)"
+assert [r["pane"] for r in monitor.build_rows(CALM, screens=False)] == ["w2:p1", "w1:p1"]
 print("ok")
 
 # --- caches: truncation, stat-keyed tails, pruning -------------------------------------------------
@@ -313,6 +531,115 @@ assert monitor.save_cols(cols) is False                                    # rep
 os.environ.pop("XDG_STATE_HOME")
 print("ok")
 
+# A columns.json from 0.4.0 gets WORKSPACE after ST and keeps every width it saved.
+sd = tempfile.mkdtemp()
+os.environ["HERDR_PLUGIN_STATE_DIR"] = sd
+OLD_COLS = {"activity": [["ST", 0], ["PANE", 9], ["AGENT", 12], ["AGE", -1], ["GOAL", 30], ["LAST PROMPT", 40], ["NOW", 0]],
+            "usage": [["ST", 2], ["PANE", 7], ["AGENT", 14], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
+                      ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]]}
+with open(os.path.join(sd, "columns.json"), "w") as f:
+    json.dump(OLD_COLS, f)
+cols = monitor.load_cols()
+WS_WIDTH = dict(monitor.VIEWS["activity"])["WORKSPACE"]
+assert WS_WIDTH > 0 and dict(monitor.VIEWS["usage"])["WORKSPACE"] == WS_WIDTH
+assert cols["activity"] == [["ST", 0], ["WORKSPACE", WS_WIDTH], ["PANE", 9], ["AGENT", 12], ["AGE", -1],
+                            ["GOAL", 30], ["LAST PROMPT", 40], ["NOW", 0]], cols["activity"]
+assert cols["usage"] == OLD_COLS["usage"][:1] + [["WORKSPACE", WS_WIDTH]] + OLD_COLS["usage"][1:], cols["usage"]
+cols["activity"][1][1] = 14
+assert monitor.save_cols(cols) and monitor.load_cols()["activity"][1] == ["WORKSPACE", 14]
+# A malformed entry costs only its own width; a column no view has any more is dropped.
+with open(os.path.join(sd, "columns.json"), "w") as f:
+    json.dump({"activity": [["ST", 3], "junk", 7, ["PANE", "9"], ["AGE", True], ["GOAL", -5], ["NOW"], ["GONE", 4]],
+               "usage": 5}, f)
+cols = monitor.load_cols()
+assert cols["activity"] == [["ST", 3]] + monitor.VIEWS["activity"][1:] and cols["usage"] == monitor.VIEWS["usage"], cols
+cols["activity"][1][1] = 99
+assert dict(monitor.VIEWS["activity"])["WORKSPACE"] == WS_WIDTH                # defaults are copied, never shared
+del os.environ["HERDR_PLUGIN_STATE_DIR"]
+print("ok")
+
+# --- the workspace choice: saved per monitor pane in this server's scope file, atomically -----------
+sd = tempfile.mkdtemp()
+SCOPE = monitor.scope_file()
+os.environ["HERDR_PLUGIN_STATE_DIR"] = sd
+assert monitor.load_choice("w1:p3") is None                                      # nothing saved yet
+assert monitor.save_choice("w1:p3", ["w1", "w2"]) and monitor.save_choice("w2:p1", "all")
+assert monitor.load_choice("w1:p3") == ["w1", "w2"] and monitor.load_choice("w2:p1") == "all"
+assert sorted(os.listdir(sd)) == [SCOPE, SCOPE[:-5] + ".lock"]                  # no temp file left
+assert monitor.save_choice("w1:p3", ["w3"]) and monitor.load_choice("w2:p1") == "all"   # other panes kept
+assert monitor.save_choice(None, "all") is False and monitor.save_choice("", ["w1"]) is False
+assert monitor.load_choice(None) is None and monitor.load_choice("") is None     # no pane id: nothing
+for bad in ("{", "[1, 2]", "null", '{"w1:p3": 5}', '{"w1:p3": []}', '{"w1:p3": "w1"}', '{"w1:p3": [7, ""]}'):
+    with open(os.path.join(sd, SCOPE), "w") as f:
+        f.write(bad)
+    assert monitor.load_choice("w1:p3") is None, bad                             # unreadable: no choice
+with open(os.path.join(sd, SCOPE), "w") as f:
+    f.write('{"w1:p3": {"scope": null, "choice": ["w1", 7, "", "w1", "w2"]}}')
+assert monitor.load_choice("w1:p3") == ["w1", "w2"]
+with open(os.path.join(sd, SCOPE), "w") as f:
+    f.write("[1, 2]")
+assert monitor.save_choice("w1:p3", "all") and monitor.load_choice("w1:p3") == "all"   # a broken file is replaced
+# A choice belongs to the AGENT_MONITOR_SCOPE (parse_scope) its monitor ran with: a monitor started with
+# another one shows that scope. One entry per pane: the last choice made there.
+assert monitor.load_choice("w1:p3", ["w2"]) is None and monitor.load_choice("w1:p3", "workspace") is None
+assert monitor.load_choice("w1:p3", None) == "all"
+assert monitor.save_choice("w1:p3", ["w1", "w2"], "workspace")                   # the crew's monitor
+assert monitor.load_choice("w1:p3", "workspace") == ["w1", "w2"]
+assert monitor.load_choice("w1:p3") is None
+assert monitor.save_choice("w1:p3", "all", ["w2", "w3"]) and monitor.load_choice("w1:p3", ["w2", "w3"]) == "all"
+for bad in ('{"w1:p3": ["w1"]}', '{"w1:p3": "all"}', '{"w1:p3": {"choice": "all"}}', '{"w1:p3": {"scope": null}}',
+            '{"w1:p3": {"scope": "w1", "choice": "all"}}', '{"w1:p3": {"scope": null, "choice": 5}}',
+            '{"w1:p3": {"scope": null, "choice": []}}', '{"w1:p3": {"scope": null, "choice": "w1"}}',
+            '{"w1:p3": {"scope": null, "choice": [7, ""]}}'):
+    with open(os.path.join(sd, SCOPE), "w") as f:
+        f.write(bad)
+    assert monitor.load_choice("w1:p3") is None, bad                             # foreign or partial entry
+os.environ["HERDR_PLUGIN_STATE_DIR"] = os.path.join(sd, SCOPE, "x")                  # under a file
+assert monitor.save_choice("w1:p3", "all") is False                                     # reported, not raised
+del os.environ["HERDR_PLUGIN_STATE_DIR"]
+print("ok")
+
+# Every herdr server (named session) numbers its workspaces and panes the same way (w1, w1:p4), and all
+# of them share the state dir: a choice is kept per server, so another server's w1:p4 never starts with it.
+os.environ["HERDR_PLUGIN_STATE_DIR"] = tempfile.mkdtemp()
+real_server = {k: os.environ.pop(k, None) for k in ("HERDR_SOCKET_PATH", "HERDR_SESSION")}
+os.environ["HERDR_SOCKET_PATH"] = "/h/.config/herdr/sessions/alpha/herdr.sock"
+assert monitor.save_choice("w1:p4", "all")
+os.environ["HERDR_SOCKET_PATH"] = "/h/.config/herdr/sessions/beta/herdr.sock"
+assert monitor.load_choice("w1:p4") is None                                 # beta's own w1:p4 chose nothing
+assert monitor.save_choice("w1:p4", ["w2"]) and monitor.load_choice("w1:p4") == ["w2"]
+os.environ["HERDR_SOCKET_PATH"] = "/h/.config/herdr/sessions/alpha/herdr.sock"
+assert monitor.load_choice("w1:p4") == "all"                                # and alpha's is kept
+del os.environ["HERDR_SOCKET_PATH"]                                         # no socket path: the session name
+os.environ["HERDR_SESSION"] = "gamma"
+assert monitor.load_choice("w1:p4") is None and monitor.save_choice("w1:p4", ["w3"])
+os.environ["HERDR_SESSION"] = "demo"
+assert monitor.load_choice("w1:p4") is None
+os.environ["HERDR_SESSION"] = "gamma"
+assert monitor.load_choice("w1:p4") == ["w3"]
+# A closed workspace's id can come back with new panes w3:p1, w3:p2...: a save drops the entries of
+# workspaces the server no longer has.
+assert monitor.save_choice("w3:p7", ["w1"]) and monitor.save_choice("w2:p1", "all")
+assert monitor.save_choice("w1:p4", ["w1", "w2"], live={"w1", "w2"})
+assert monitor.load_choice("w3:p7") is None and monitor.load_choice("w2:p1") == "all"
+assert monitor.load_choice("w1:p4") == ["w1", "w2"]
+# Monitors of one server that save at the same moment keep each other's entries.
+RACE = ("import sys, monitor\n"
+        "for i in range(300):\n"
+        "    assert monitor.save_choice('%s:p%d' % (sys.argv[1], i), ['w1'])\n")
+racers = [subprocess.Popen([sys.executable, "-c", RACE, ws], cwd=os.path.dirname(os.path.abspath(__file__)))
+          for ws in ("w5", "w6")]
+assert [p.wait(60) for p in racers] == [0, 0]
+saved = monitor.load_state(monitor.scope_file())
+lost = [f"{ws}:p{i}" for ws in ("w5", "w6") for i in range(300) if f"{ws}:p{i}" not in saved]
+assert not lost and monitor.load_choice("w2:p1") == "all", (len(lost), lost[:5])
+assert not [n for n in os.listdir(os.environ["HERDR_PLUGIN_STATE_DIR"]) if n.endswith(".tmp")]
+del os.environ["HERDR_SESSION"], os.environ["HERDR_PLUGIN_STATE_DIR"]
+for k, v in real_server.items():
+    if v is not None:
+        os.environ[k] = v
+print("ok")
+
 # --- odd records after a server restart never kill the refresh -------------------------------------
 monitor.HERDR = fake_herdr({"agent read": (0, "")})
 odd = {"agents": [{"pane_id": "w1:p7", "workspace_id": "w1", "agent_status": "idle"},   # no "agent"
@@ -330,13 +657,13 @@ monitor.collect = real_collect
 print("ok")
 
 # --- tiny and narrow panes: the TUI keeps running ---------------------------------------------------
-import curses
+import curses, threading
 
 
 class FakeScreen:
     """Raises curses.error where real curses does: outside the window, or writing the last cell."""
     def __init__(self, h, w, keys):
-        self.h, self.w, self.keys = h, w, list(keys)
+        self.h, self.w, self.keys, self.quits = h, w, list(keys), 0
 
     def getmaxyx(self):
         return self.h, self.w
@@ -355,7 +682,11 @@ class FakeScreen:
         self._check(y, x, n)
 
     def getch(self):
-        return self.keys.pop(0) if self.keys else ord("q")
+        if self.keys:
+            return self.keys.pop(0)
+        self.quits += 1  # then q until it quits: fail instead of hanging when q stops working
+        assert self.quits < 20, "the TUI does not quit on q"
+        return ord("q")
 
     keypad = timeout = nodelay = erase = refresh = lambda self, *a: None
 
@@ -366,12 +697,218 @@ saved_fns = (monitor.init_colors, monitor.refresh_forever, curses.curs_set, geta
 monitor.init_colors = lambda: C0
 curses.curs_set = lambda n: None
 curses.ACS_HLINE = ord("-")
+real_pane_id = os.environ.pop("HERDR_PANE_ID", None)    # the TUI keeps a choice per pane: tests set their own
+os.environ["HERDR_PLUGIN_STATE_DIR"] = tempfile.mkdtemp()
 crew_rows = monitor.build_rows(CREW)
-monitor.refresh_forever = lambda state, every=2.0: state.update(data=(crew_rows, ""), scope="workspace one (w1)")
+landed = threading.Event()
+
+
+class Landed(FakeScreen):
+    """Reads no key before the refresh has landed: w opens the picker only once workspaces are listed."""
+    def getch(self):
+        landed.wait(5)
+        return super().getch()
+
+
+def tiny_refresh(state, every=2.0):
+    state.update(data=(crew_rows, ""), scope="workspace one (w1)", shown=["w1"], spaces=SPACES)
+    landed.set()
+
+
+monitor.refresh_forever = tiny_refresh
+real_draw_picker, pickers = monitor.draw_picker, []
+monitor.draw_picker = lambda *a: (pickers.append(1), real_draw_picker(*a))
 for h in range(1, 9):
     for w in (1, 2, 5, 11, 12, 20, 40):
-        for keys in ([], [ord("d"), -1], [ord("v"), -1], [ord("v"), ord("d"), -1]):
-            monitor.tui(FakeScreen(h, w, keys))          # no curses.error escapes
+        for keys in ([], [ord("d"), -1], [ord("v"), -1], [ord("v"), ord("d"), -1],
+                     [ord("w"), -1], [ord("w"), ord(" "), 10, -1], [ord("v"), ord("w"), ord("j"), ord(" "), -1]):
+            landed.clear()
+            monitor.tui(Landed(h, w, keys))              # no curses.error escapes
+monitor.draw_picker = real_draw_picker
+assert pickers                                           # the picker was drawn in those panes too
+print("ok")
+
+# --- the w picker in the TUI: keys, the choice saved per monitor pane, restored on start -------------
+class Screen(FakeScreen):
+    """Waits for the first refresh and keeps the text of the frame on screen at each getch. A callable in
+    keys is a step: it runs on the shared state (got["state"]) before the next key is read."""
+    def __init__(self, h, w, keys, ready, got):
+        super().__init__(h, w, keys)
+        self.ready, self.got, self.cells, self.frames = ready, got, {}, []
+
+    def erase(self):
+        self.cells = {}
+
+    def addnstr(self, y, x, text, n, attr=0):
+        super().addnstr(y, x, text, n, attr)
+        self.cells.update(((y, x + i), ch) for i, ch in enumerate(text[:n]))
+
+    def addstr(self, y, x, text, attr=0):
+        super().addstr(y, x, text, attr)
+        self.cells.update(((y, x + i), ch) for i, ch in enumerate(text))
+
+    def getch(self):
+        self.ready.wait(5)
+        self.frames.append(["".join(self.cells.get((y, x), " ") for x in range(self.w)).rstrip()
+                            for y in range(self.h)])
+        while self.keys and callable(self.keys[0]):
+            self.keys.pop(0)(self.got["state"])
+        return super().getch()
+
+
+def landing(rows, shown, spaces=None):
+    """A step for run_tui's keys: a refresh lands with rows of `shown` among SNAP's workspaces (or spaces)."""
+    return lambda state: state.update(data=(rows, ""), scope=monitor.scope_label(shown, SNAP), shown=shown,
+                                      spaces=SPACES if spaces is None else spaces)
+
+
+def run_tui(keys, rows, shown, h=14, w=110):
+    """tui() whose first refresh lands at once, showing rows of `shown` among SNAP's workspaces; with rows
+    None, only landing() steps in keys bring data.
+    -> (screen, {"start": the choice the refresh started with, "state": the shared state}).
+    frames[1] is the first frame with the refresh's data, frames[n + 1] the one after the nth key."""
+    ready, got = threading.Event(), {}
+
+    def refresh(state, every=2.0):
+        got.update(start=state.get("choice"), state=state)
+        if rows is not None:
+            landing(rows, shown)(state)
+        ready.set()
+    monitor.refresh_forever = refresh
+    scr = Screen(h, w, [-1] + keys, ready, got)
+    monitor.tui(scr)
+    return scr, got
+
+
+SD = tempfile.mkdtemp()
+os.environ["HERDR_PLUGIN_STATE_DIR"] = SD
+os.environ["HERDR_PANE_ID"] = "w1:p9"
+real_socket = os.environ.get("HERDR_SOCKET_PATH")
+os.environ["HERDR_SOCKET_PATH"] = ALPHA = "/h/.config/herdr/sessions/alpha/herdr.sock"
+scope_file = os.path.join(SD, monitor.scope_file())
+w1_rows = monitor.build_rows(SNAP, ["w1"], screens=False)
+
+# w opens on what is shown; j j space: w2 ticked; Enter: applied, saved for this pane, refresh woken.
+# The save drops the entry of a pane whose workspace (w7) the server no longer has.
+assert monitor.save_choice("w7:p1", "all")
+scr, got = run_tui([ord("w"), ord("j"), ord("j"), ord(" "), 10], w1_rows, ["w1"])
+assert scr.frames[2][2:5] == [" [ ] All workspaces", " [x] one  w1  2 agents", " [ ] two  w2  1 agent"], scr.frames[2]
+assert "space toggle" in scr.frames[2][-1] and "esc close" in scr.frames[2][-1]      # the picker's keys
+with open(scope_file) as f:
+    assert json.load(f) == {"w1:p9": {"scope": None, "choice": ["w1", "w2"]}}
+assert got["state"]["choice"] == ["w1", "w2"] and got["state"]["wake"].is_set()
+assert "w workspaces" in scr.frames[-1][-1] and "space toggle" not in scr.frames[-1][-1], scr.frames[-1]
+# The same pane's monitor starts with it again; another pane has none of its own.
+assert run_tui([], w1_rows, ["w1"])[1]["start"] == ["w1", "w2"]
+os.environ["HERDR_PANE_ID"] = "w2:p4"
+assert run_tui([], w1_rows, ["w1"])[1]["start"] is None
+os.environ["HERDR_SOCKET_PATH"], os.environ["HERDR_PANE_ID"] = "/h/.config/herdr/sessions/beta/herdr.sock", "w1:p9"
+assert run_tui([], w1_rows, ["w1"])[1]["start"] is None             # nor does another server's w1:p9
+os.environ["HERDR_SOCKET_PATH"], os.environ["AGENT_MONITOR_SCOPE"] = ALPHA, "w2"
+assert run_tui([], w1_rows, ["w1"])[1]["start"] is None             # nor one started with another scope,
+scr, got = run_tui([ord("w"), ord("a"), 10], w1_rows, ["w1"])       # which keeps what it picks for that scope
+assert run_tui([], w1_rows, ["w1"])[1]["start"] == "all"
+with open(scope_file) as f:
+    assert json.load(f)["w1:p9"] == {"scope": ["w2"], "choice": "all"}
+del os.environ["AGENT_MONITOR_SCOPE"]
+assert run_tui([], w1_rows, ["w1"])[1]["start"] is None
+os.environ["HERDR_PANE_ID"] = "w2:p4"
+with open(scope_file) as f:
+    before = f.read()
+# Esc, w and q close it without changing anything; the next q quits.
+for close in ([27, -1], [ord("w")], [ord("q")]):
+    scr, got = run_tui([ord("w"), ord("j"), ord(" ")] + close, w1_rows, ["w1"])
+    after = scr.frames[4 + len(close)]                         # the frame right after the closing key
+    assert got["state"]["choice"] is None and "space toggle" not in after[-1], (close, after)
+    assert len(scr.frames) == 5 + len(close), close
+# Enter with nothing selected keeps it open, with a hint.
+scr, got = run_tui([ord("w"), ord("j"), ord(" "), 10], w1_rows, ["w1"])
+assert "nothing selected" in scr.frames[5][-1] and " [ ] one  w1  2 agents" in scr.frames[5], scr.frames[5]
+assert got["state"]["choice"] is None
+# Mouse input never reaches the table under the picker; without the picker a click opens details.
+click = [27] + [ord(c) for c in "[<0;5;3M"]                       # press on the first agent row
+scr, got = run_tui([ord("w")] + click + [27, -1], w1_rows, ["w1"])
+assert not any("esc close, ⏎ jump" in line for frame in scr.frames for line in frame)
+scr, got = run_tui(click, w1_rows, ["w1"])
+assert any("esc close, ⏎ jump" in line for line in scr.frames[-1]), scr.frames[-1]
+with open(scope_file) as f:
+    assert f.read() == before
+# Dragging the WORKSPACE column's edge resizes it and saves the width.
+spec = monitor.layout(monitor.fit_cols(monitor.load_cols()["activity"], w1_rows), 109)
+x, cw = next((x, cw) for i, x, cw in spec if i == 1)
+mouse = lambda b, mx, end: [27] + [ord(c) for c in f"[<{b};{mx + 1};2{end}"]
+scr, got = run_tui(mouse(0, x + cw, "M") + mouse(32, x + cw + 4, "M") + mouse(0, x + cw + 4, "m"), w1_rows, ["w1"])
+assert monitor.load_cols()["activity"][1] == ["WORKSPACE", cw + 4], monitor.load_cols()["activity"]
+# The picker takes no mouse input, so a drag still going when w opens it ends there, as its release would:
+# after esc, a click on a row opens its details instead of resizing the column.
+x, cw = next((x, cw) for i, x, cw in monitor.layout(monitor.fit_cols(monitor.load_cols()["activity"], w1_rows), 109)
+             if i == 1)
+row_click = click + [27] + [ord(c) for c in "[<0;5;3m"]
+scr, got = run_tui(mouse(0, x + cw, "M") + [ord("w")] + mouse(0, x + cw, "m") + [27, -1] + row_click, w1_rows, ["w1"])
+assert monitor.load_cols()["activity"][1] == ["WORKSPACE", cw], monitor.load_cols()["activity"]
+assert any("esc close, ⏎ jump" in line for line in scr.frames[-1]), scr.frames[-1]
+# Reopened before the refresh it woke has landed, the picker shows the choice in force, not the rows still
+# drawn: both workspaces ticked, so unticking one applies the other alone.
+os.environ["HERDR_PANE_ID"] = "w1:p5"
+apply_both = [ord("w"), ord("j"), ord("j"), ord(" "), 10]
+scr, got = run_tui(apply_both + [ord("w"), 10], w1_rows, ["w1"])
+assert scr.frames[7][2:5] == [" [ ] All workspaces", " [x] one  w1  2 agents", " [x] two  w2  1 agent"], scr.frames[7]
+assert got["state"]["choice"] == ["w1", "w2"] and monitor.load_choice("w1:p5") == ["w1", "w2"]   # Enter: no change
+scr, got = run_tui(apply_both[:1] + [ord("a"), 10, ord("w"), ord(" "), ord("j"), ord(" "), 10], w1_rows, ["w1"])
+assert got["state"]["choice"] == ["w1"], got["state"]["choice"]                  # from ALL: all off, one on
+# Before the first refresh lands nothing is known to list, so w opens nothing; once it lands, w opens on
+# what is shown and an explicit ALL applies.
+os.environ["HERDR_PANE_ID"] = "w1:p6"
+scr, got = run_tui([ord("w"), landing(w1_rows, ["w1"]), -1, ord("w"), ord("a"), 10], None, None)
+assert not any("workspaces to show" in line for line in scr.frames[2]), scr.frames[2]
+assert scr.frames[4][1:4] == [" workspaces to show", " [ ] All workspaces", " [x] one  w1  2 agents"], scr.frames[4]
+assert got["state"]["choice"] == "all" and monitor.load_choice("w1:p6") == "all"
+# The picker keeps the workspaces it listed while it is open, so a refresh never moves a line under the
+# cursor: w1 closes while the cursor is on two, and space still ticks two.
+os.environ["HERDR_PANE_ID"] = "w1:p7"
+THREE = SPACES + [{"id": "w3", "label": "three", "agents": 1}]
+scr, got = run_tui([landing(w1_rows, ["w1"], THREE), -1, ord("w"), ord("j"), ord("j"),
+                    landing(w1_rows, ["w1"], THREE[1:]), ord(" "), 10], None, None)
+assert scr.frames[6][2:6] == [" [ ] All workspaces", " [x] one    w1  2 agents", " [x] two    w2  1 agent",
+                              " [ ] three  w3  1 agent"], scr.frames[6]
+assert got["state"]["choice"] == ["w1", "w2"], got["state"]["choice"]
+# When a refresh brings other rows (a new choice, an agent that turned blocked), the selection and its
+# details stay on the same agent while it is listed.
+SEL = {"agents": [agent("w1:p1", status="blocked"), agent("w1:p3"), agent("w2:p1", status="blocked"), agent("w3:p2")],
+       "workspaces": [{"workspace_id": "w1"}, {"workspace_id": "w2"}, {"workspace_id": "w3"}]}
+every_row = monitor.build_rows(SEL, screens=False)
+assert [r["pane"] for r in every_row] == ["w1:p1", "w1:p3", "w2:p1", "w3:p2"]
+details = lambda frame: next((line.strip() for line in frame if "esc close, ⏎ jump" in line), None)
+scr, got = run_tui([ord("j"), ord("j"), ord("d"), landing(monitor.build_rows(SEL, ["w2", "w3"], screens=False), None),
+                    -1, ord("k"), landing(every_row, None), -1], every_row, None)
+assert details(scr.frames[4]).startswith("w2:p1 · pi · blocked") and details(scr.frames[5]) == details(scr.frames[4])
+assert details(scr.frames[6]).startswith("w2:p1") and details(scr.frames[7]).startswith("w2:p1"), scr.frames[7]
+os.environ["HERDR_PANE_ID"] = "w2:p4"
+# Title and empty state for a set of workspaces.
+scr, got = run_tui([], [], ["w1", "w2"])
+assert scr.frames[1][0] == " agent monitor · 2 workspaces: one, two · 0 agents", scr.frames[1][0]
+assert scr.frames[1][2] == " no agents in 2 workspaces: one, two", scr.frames[1]
+# A narrow pane cuts the scope, never the context alert; --once prints the alert once.
+hot = [dict(r, pct=95.0) if r["pane"] == "w1:p1" else r for r in monitor.build_rows(SNAP, ["w1", "w2"], screens=False)]
+scr, got = run_tui([], hot, ["w1", "w2"], w=50)
+assert scr.frames[1][0] == " agent monitor · 2 w… · 3 agents · 1 context ≥90%", scr.frames[1][0]
+real_collect = monitor.collect
+monitor.collect = lambda wait=False, choice=None: (hot, "2 workspaces: one, two", ["w1", "w2"], SPACES)
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    assert monitor.once(["--once"]) == 0
+assert out.getvalue().splitlines()[0] == "agent monitor · 2 workspaces: one, two · 3 agents · 1 context ≥90%"
+monitor.collect = real_collect
+# Without HERDR_PANE_ID the choice applies to this run only.
+os.environ.pop("HERDR_PANE_ID")
+os.environ["HERDR_PLUGIN_STATE_DIR"] = SD2 = tempfile.mkdtemp()
+scr, got = run_tui([ord("w"), ord("a"), 10], w1_rows, ["w1"])
+assert got["state"]["choice"] == "all" and os.listdir(SD2) == []
+del os.environ["HERDR_PLUGIN_STATE_DIR"], os.environ["HERDR_SOCKET_PATH"]
+if real_pane_id is not None:
+    os.environ["HERDR_PANE_ID"] = real_pane_id
+if real_socket is not None:
+    os.environ["HERDR_SOCKET_PATH"] = real_socket
 monitor.init_colors, monitor.refresh_forever, curses.curs_set = saved_fns[:3]
 print("ok")
 

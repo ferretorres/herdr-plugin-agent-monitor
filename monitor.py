@@ -10,19 +10,23 @@ Data: one `herdr api snapshot` per refresh (agents, panes, workspaces) + per age
   other  -> last lines of the pane's screen (`herdr agent read`, in the background); no token data
 Writes: only its own am_* sidebar tokens and a context-90% toast (publish), from the open monitor and
 from the pane.agent_status_changed hook (`monitor.py --hook`).
-Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspace) | <workspace id>.
-Crew tokens on panes order the rows: a lead (crew_role=lead), then its workers (crew_lead=<lead pane>).
+Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspace) | <workspace id>[,<id>...].
+The w picker replaces it with all workspaces or a set of them, saved per monitor pane (HERDR_PANE_ID) of each
+herdr server for the AGENT_MONITOR_SCOPE it was made under.
+Rows go by workspace in sidebar order; inside one, crew tokens order them: a lead (crew_role=lead), then
+its workers (crew_lead=<lead pane>).
 
 Views (v to switch): activity (goal, last prompt, current action) and usage (context, tokens, cost).
 Mouse: click a row for full details (click again to close), drag a header │ to resize,
-       wheel to scroll. Keys: ↑↓ select · ⏎ jump to pane · v view · d details · esc close ·
+       wheel to scroll. Keys: ↑↓ select · ⏎ jump to pane · v view · w workspaces · d details · esc close ·
        ←→ pick column · +/- width · 0 fill · space hide/show · q quit.
-Column widths persist in columns.json under the plugin state dir; prices (USD per 1M tokens) in
-prices.json in the plugin config folder (see config_dir) or next to this file. PANE is coloured with the sc_<palette> token of
-ferretorres/herdr-plugin-space-colors when that plugin is installed.
+Column widths persist in columns.json and the workspace choices in scope-<server>.json under the plugin state dir;
+prices (USD per 1M tokens) in prices.json in the plugin config folder (see config_dir) or next to this file.
+WORKSPACE and PANE are coloured with the sc_<palette> tokens of ferretorres/herdr-plugin-space-colors when
+that plugin is installed.
 Run `monitor.py --once [--usage]` for a single plain-text frame.
 """
-import curses, glob, hashlib, json, os, re, sqlite3, subprocess, sys, textwrap, threading, time, urllib.parse
+import curses, fcntl, glob, hashlib, json, os, re, sqlite3, subprocess, sys, textwrap, threading, time, urllib.parse
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,9 +35,10 @@ GLYPH = {"working": "●", "blocked": "▲", "idle": "○", "done": "✓", "unkn
 ORDER = {"blocked": 0, "working": 1, "idle": 2, "done": 3, "unknown": 4}
 # per view: [name, width]; width 0 = share the rest, -1 = hidden
 VIEWS = {
-    "activity": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["AGE", 5], ["GOAL", 34], ["LAST PROMPT", 40], ["NOW", 0]],
-    "usage": [["ST", 2], ["PANE", 7], ["AGENT", 12], ["MODEL", 18], ["CTX", 7], ["CTX%", 5], ["IN", 7],
-              ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]],
+    "activity": [["ST", 2], ["WORKSPACE", 10], ["PANE", 7], ["AGENT", 12], ["AGE", 5], ["GOAL", 34],
+                 ["LAST PROMPT", 40], ["NOW", 0]],
+    "usage": [["ST", 2], ["WORKSPACE", 10], ["PANE", 7], ["AGENT", 12], ["MODEL", 18], ["CTX", 7], ["CTX%", 5],
+              ["IN", 7], ["CACHE R", 8], ["CACHE W", 8], ["OUT", 7], ["COST", 8], ["AGE", 5], ["GOAL", 0]],
 }
 # Anthropic first-party list prices, USD per 1M tokens (https://www.anthropic.com/pricing, 2026-11-26).
 # cache_write is the 5-minute cache write, cache_write_1h the 1-hour one. Bedrock / gateway billing
@@ -767,36 +772,93 @@ def snapshot():
     return herdr_json("api", "snapshot").get("snapshot") or {}
 
 
-def scope_workspace():
-    """None = every workspace, else the workspace id to show. AGENT_MONITOR_SCOPE is
-    all (default) | workspace | <workspace id>. `workspace` asks herdr where this pane is now,
-    so a monitor pane moved to another workspace follows it; HERDR_WORKSPACE_ID is the fallback."""
-    scope = os.environ.get("AGENT_MONITOR_SCOPE", "").strip() or "all"
-    if scope == "all":
+def workspaces(snap):
+    """{workspace id: record} in snapshot (sidebar) order, odd records left out."""
+    return {w["workspace_id"]: w for w in snap.get("workspaces") or []
+            if isinstance(w, dict) and isinstance(w.get("workspace_id"), str) and w["workspace_id"]}
+
+
+def workspace_counts(snap):
+    """Every workspace on the server in snapshot order, with its label and live agent count."""
+    n = {}
+    for a in filter(None, map(agent_entry, snap.get("agents") or [])):
+        ws = _s(a.get("workspace_id"))
+        n[ws] = n.get(ws, 0) + 1
+    return [{"id": ws, "label": one_line(_s(w.get("label"))), "agents": n.get(ws, 0)} for ws, w in workspaces(snap).items()]
+
+
+def parse_scope(value):
+    """AGENT_MONITOR_SCOPE: all or empty -> None, "workspace", else a comma-separated list of ids."""
+    value = (value or "").strip()
+    if value in ("", "all"):
         return None
+    if value == "workspace":
+        return value
+    return list(dict.fromkeys(i.strip() for i in value.split(",") if i.strip())) or None
+
+
+def scope_workspace():
+    """None = every workspace, else the workspace ids to show. AGENT_MONITOR_SCOPE is
+    all (default) | workspace | <workspace id>[,<id>...]. `workspace` asks herdr where this pane is now,
+    so a monitor pane moved to another workspace follows it; HERDR_WORKSPACE_ID is the fallback."""
+    scope = parse_scope(os.environ.get("AGENT_MONITOR_SCOPE"))
     if scope != "workspace":
         return scope
     try:
         ws = (herdr_json("pane", "current", "--current").get("pane") or {}).get("workspace_id")
     except (HerdrError, subprocess.TimeoutExpired):
         ws = None
-    return ws or os.environ.get("HERDR_WORKSPACE_ID") or None
+    ws = ws or os.environ.get("HERDR_WORKSPACE_ID")
+    return [ws] if ws else None
+
+
+def resolve_scope(choice, snap, env_scope):
+    """Workspace ids to show, None = all: the picker's choice ("all", or its ids that still exist,
+    in snapshot order), else env_scope() when there is no choice or none of its ids is left."""
+    if choice == "all":
+        return None
+    ids = [ws for ws in workspaces(snap) if ws in (choice or ())]
+    return ids or env_scope()
 
 
 def scope_label(ws, snap):
+    """The title's scope for ws (None = all, else workspace ids, or one id): "workspace one (w1)",
+    else "N workspaces: one, two" in snapshot order; ids the server does not have are flagged."""
     if ws is None:
         return "all workspaces"
-    w = next((w for w in snap.get("workspaces") or [] if w.get("workspace_id") == ws), None)
-    if w is None:
-        return f"workspace {ws} (not found)"
-    return f"workspace {w.get('label') or ws} ({ws})" if w.get("label") not in (None, "", ws) else f"workspace {ws}"
+    ids, spaces = [ws] if isinstance(ws, str) else list(ws), workspaces(snap)
+    if len(ids) == 1:
+        ws, w = ids[0], spaces.get(ids[0])
+        if w is None:
+            return f"workspace {ws} (not found)"
+        label = one_line(_s(w.get("label")))
+        return f"workspace {label} ({ws})" if label not in ("", ws) else f"workspace {ws}"
+    pos = {i: n for n, i in enumerate(spaces)}
+    names = [(one_line(_s(spaces[i].get("label"))) or i) if i in spaces else f"{i} (not found)"
+             for i in sorted(ids, key=lambda i: pos.get(i, len(pos)))]
+    return f"{len(ids)} workspaces: " + ", ".join(names)
 
 
-def collect(wait=False):
-    """(rows, scope label) for one refresh. wait: block for screen reads (one-shot output)."""
-    ws = scope_workspace()
+def ctx_alert(rows):
+    """' · N context ≥90%' for the rows past CTX_NOTIFY, else ''."""
+    full = sum(1 for r in rows if r["pct"] is not None and r["pct"] >= CTX_NOTIFY)
+    return f" · {full} context ≥{CTX_NOTIFY}%" if full else ""
+
+
+def title_text(scope, n, width, alert=""):
+    """'agent monitor · <scope> · N agents<alert>' in width: a long scope is cut (…) so the count and
+    the alert (ctx_alert) show."""
+    head, tail = "agent monitor · ", f" · {n} agents{alert}"
+    room = width - len(head) - len(tail)
+    return head + (scope if len(scope) <= room else scope[:max(0, room - 1)] + "…") + tail
+
+
+def collect(wait=False, choice=None):
+    """(rows, scope label, workspace ids shown or None for all, the server's workspaces) for one
+    refresh. choice: the picker's, else AGENT_MONITOR_SCOPE applies. wait: block for screen reads."""
     snap = snapshot()
-    return build_rows(snap, ws, wait), scope_label(ws, snap)
+    ws = resolve_scope(choice, snap, scope_workspace)
+    return build_rows(snap, ws, wait), scope_label(ws, snap), ws, workspace_counts(snap)
 
 
 def transcript(a):
@@ -821,8 +883,10 @@ def agent_entry(a):
 
 
 def build_rows(snap, ws=None, wait=False, screens=True):
+    """Rows for the agents in ws: None = every workspace, else workspace ids (or one id)."""
+    keep = None if ws is None else (ws,) if isinstance(ws, str) else tuple(ws)
     agents = [e for e in map(agent_entry, snap.get("agents") or [])
-              if e and (ws is None or e.get("workspace_id") == ws)]
+              if e and (keep is None or e.get("workspace_id") in keep)]
     found = {a["pane_id"]: transcript(a) for a in agents}
     oc = {a["pane_id"]: opencode_read(a) for a in agents if a["agent"] == "opencode"}
     want_screen = [a for a in agents if not found[a["pane_id"]] and not oc.get(a["pane_id"])]
@@ -834,7 +898,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
     else:  # the hook: no screen reads, these rows only feed the sidebar and the toast
         screens = {a["pane_id"]: {"value": ("", "", None)} for a in want_screen}
     panes = {p.get("pane_id"): p for p in snap.get("panes") or []}
-    spaces = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
+    spaces = workspaces(snap)
     tabs = {t.get("tab_id"): t for t in snap.get("tabs") or []}
     prices = load_prices()
     rows = []
@@ -854,18 +918,22 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         goal = a.get("title") or a.get("terminal_title_stripped") or ""  # title: report-metadata --title
         tokens = a.get("tokens") or {}
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
-        palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"),
-                             (spaces.get(a.get("workspace_id")) or {}).get("tokens"))
+        ws = _s(a.get("workspace_id"))
+        space = spaces.get(ws) or {}
+        palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"), space.get("tokens"))
         rows.append({
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
-            "space": palette, "parent": lead if role == "worker" else None,
+            # PANE takes the agent's colour (space-colors can pin one), WORKSPACE the workspace's own.
+            "space": palette, "ws": ws, "ws_space": sc_palette(space.get("tokens")) or palette,
+            "parent": lead if role == "worker" else None,
             "pct": pct, "usd": usd, "usd_src": usd_src, "usage": usage,
             "tokens": tokens, "labels": a.get("state_labels") or {},
             "session": path or (a.get("agent_session") or {}).get("value") or "",
-            "place": " · ".join(x for x in ((spaces.get(a.get("workspace_id")) or {}).get("label"),
-                                            (tabs.get(a.get("tab_id")) or {}).get("label"), a["pane_id"]) if x),
+            "place": " · ".join(x for x in (space.get("label"), (tabs.get(a.get("tab_id")) or {}).get("label"),
+                                            a["pane_id"]) if x),
             "cells": {
-                "ST": GLYPH.get(a["agent_status"], "?"), "PANE": a["pane_id"], "AGENT": a.get("name") or a["agent"],
+                "ST": GLYPH.get(a["agent_status"], "?"), "WORKSPACE": one_line(_s(space.get("label"))) or ws,
+                "PANE": a["pane_id"], "AGENT": a.get("name") or a["agent"],
                 "AGE": ago(ts), "GOAL": one_line(goal), "LAST PROMPT": one_line(prompt), "NOW": one_line(now),
                 "MODEL": u.get("model", ""), "CTX": num(u.get("ctx")),
                 "CTX%": f"{pct:.0f}%" if pct is not None else "",
@@ -881,7 +949,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         })
     prune_caches()
     rows.sort(key=lambda r: (ORDER.get(r["status"], len(ORDER)), pane_key(r["pane"])))
-    return tree_order(rows)
+    return space_order(rows, spaces)
 
 
 def read_agent(a, path, oc, screen):
@@ -902,6 +970,19 @@ def read_agent(a, path, oc, screen):
 def pane_key(pane_id):
     """w2:p10 -> ["w", 2, ":p", 10, ""], so w2 sorts before w10."""
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", pane_id or "")]
+
+
+def space_order(rows, spaces):
+    """Rows by workspace, the one with the most urgent agent first so blocked agents stay at the top,
+    then in snapshot (sidebar) order, then workspaces the snapshot does not list, by id; each workspace's
+    rows in tree_order, so a worker whose lead is elsewhere is a root."""
+    pos = {ws: n for n, ws in enumerate(spaces)}
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["ws"], []).append(r)
+    urgent = {ws: min(ORDER.get(r["status"], len(ORDER)) for r in rs) for ws, rs in groups.items()}
+    return [r for ws in sorted(groups, key=lambda ws: (urgent[ws], pos.get(ws, len(pos)), pane_key(ws)))
+            for r in tree_order(groups[ws])]
 
 
 def tree_order(rows):
@@ -1015,26 +1096,92 @@ def load_cols():
             continue
     if not isinstance(saved, dict):
         saved = {}  # older single-view format
-    return {v: saved[v] if [c[0] for c in saved.get(v, [])] == [c[0] for c in d] else [c[:] for c in d]
-            for v, d in VIEWS.items()}
+    return {v: merge_cols(saved.get(v), d) for v, d in VIEWS.items()}
+
+
+def merge_cols(saved, default):
+    """The view's default columns, in their order, with the widths saved for them: a column added
+    since the file was written gets its default width, and a malformed entry is skipped."""
+    entries = saved if isinstance(saved, list) else []
+    widths = {c[0]: c[1] for c in entries if isinstance(c, list) and len(c) == 2 and isinstance(c[0], str)
+              and type(c[1]) is int and c[1] >= -1}
+    return [[name, widths.get(name, width)] for name, width in default]
 
 
 def save_cols(colsets):
-    """Write via a temp file + rename, so monitors in other panes never read half a file.
-    False when it could not be saved (read-only disk...); the widths still apply in this pane."""
+    """False when the widths could not be saved (read-only disk...); they still apply in this pane."""
+    return save_state("columns.json", colsets)
+
+
+def save_state(name, data):
+    """Write a JSON file in the state dir via a temp file + rename, so monitors in other panes never
+    read half a file. False when it could not be written."""
     folder = state_dir()
-    tmp = os.path.join(folder, f".columns.{os.getpid()}.tmp")
+    tmp = os.path.join(folder, f".{name}.{os.getpid()}.tmp")
     try:
         os.makedirs(folder, exist_ok=True)
         with open(tmp, "w") as f:
-            json.dump(colsets, f)
-        os.replace(tmp, os.path.join(folder, "columns.json"))
+            json.dump(data, f)
+        os.replace(tmp, os.path.join(folder, name))
         return True
     except OSError:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        return False
+
+
+def load_state(name):
+    """A JSON object from the state dir; {} when it is missing or unreadable."""
+    try:
+        with open(os.path.join(state_dir(), name)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def scope_file():
+    """This herdr server's file of workspace choices. Every server numbers its workspaces and panes the
+    same way (w1, w1:p4) and all of them share the state dir, so each has its own file, named after its
+    socket (HERDR_SOCKET_PATH), else its session name (HERDR_SESSION)."""
+    server = os.environ.get("HERDR_SOCKET_PATH") or "session:" + (os.environ.get("HERDR_SESSION") or "")
+    return f"scope-{hashlib.sha256(server.encode()).hexdigest()[:12]}.json"
+
+
+def load_choice(pane, scope=None):
+    """The workspace choice saved for this monitor pane if it was made under the same AGENT_MONITOR_SCOPE
+    (parse_scope): "all", workspace ids, or None. A monitor started with another scope shows that one."""
+    entry = load_state(scope_file()).get(pane) if pane else None
+    if not isinstance(entry, dict) or "scope" not in entry or entry["scope"] != scope:
+        return None
+    v = entry.get("choice")
+    if v == "all":
+        return v
+    ids = [i for i in v if isinstance(i, str) and i] if isinstance(v, list) else []
+    return list(dict.fromkeys(ids)) or None
+
+
+def save_choice(pane, choice, scope=None, live=None):
+    """Keep this monitor pane's choice and the AGENT_MONITOR_SCOPE it was made under for its next start,
+    in this server's scope file ({pane id: {"scope", "choice"}}). Pane ids survive a herdr restart, but a
+    closed workspace's id can be given to a new workspace, so the entries of workspaces not in live (the ids
+    on the server now) are dropped. The server's monitors share the file, so the read-modify-write holds a
+    lock. Without a pane id (HERDR_PANE_ID) nothing is saved."""
+    if not pane:
+        return False
+    name = scope_file()
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(os.path.join(state_dir(), os.path.splitext(name)[0] + ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = load_state(name)
+            if live is not None:
+                data = {p: c for p, c in data.items() if p.split(":")[0] in live}
+            data[pane] = {"scope": scope, "choice": choice}
+            return save_state(name, data)
+    except OSError:
         return False
 
 
@@ -1090,8 +1237,8 @@ def space_pairs(big):
 
 
 def cell_attr(C, row, name):
-    if name == "PANE":  # workspace colour, as in the herdr sidebar with space-colors
-        return C["space"].get(row["space"], 0)
+    if name in ("PANE", "WORKSPACE"):  # the colours of the herdr sidebar with space-colors
+        return C["space"].get(row.get("ws_space") if name == "WORKSPACE" else row["space"], 0)
     if name == "ST":
         return C["status"].get(row["status"], 0)
     if name == "AGENT":
@@ -1109,6 +1256,67 @@ def cell_attr(C, row, name):
     if row["status"] == "idle" and name != "GOAL":
         return C["dim"]
     return 0
+
+
+def picker_open(shown, spaces, choice=None):
+    """The w picker's state, on the choice in force (ALL, or its ids that are listed), which applies
+    before a refresh shows it, else on the workspaces shown now (None = all, else their ids). It keeps
+    spaces (workspace_counts), the workspaces it lists, while it is open, so a refresh never moves a line
+    under the cursor."""
+    listed = {s["id"] for s in spaces}
+    if choice == "all" or (choice and listed & set(choice)):
+        shown = None if choice == "all" else choice
+    ids = set(shown or ())
+    was = frozenset(ids & listed)
+    return {"at": 0, "all": shown is None, "ids": ids, "was": (shown is None, was), "hint": "",
+            "spaces": list(spaces)}
+
+
+def picker_step(p, action):
+    """(picker state or None once closed, choice to apply or None) after one action: up, down,
+    toggle (on line 0, All workspaces: every workspace on or off), all, apply or close.
+    Applying the selection the picker opened on closes it without a choice, so what applied before
+    (a saved choice or AGENT_MONITOR_SCOPE, which can follow the pane's workspace) still does."""
+    ids = [s["id"] for s in p["spaces"]]
+    p = dict(p, at=min(p["at"], len(ids)), hint="")
+    if action in ("up", "down"):
+        p["at"] = max(0, min(len(ids), p["at"] + (1 if action == "down" else -1)))
+    elif action == "all" or (action == "toggle" and p["at"] == 0 and not p["all"]):
+        p["all"], p["ids"] = True, set()
+    elif action == "toggle" and p["at"] == 0:
+        p["all"], p["ids"] = False, set()
+    elif action == "toggle":
+        p["ids"] = (set(ids) if p["all"] else set(p["ids"])) ^ {ids[p["at"] - 1]}
+        p["all"] = False
+    elif action == "apply":
+        chosen = "all" if p["all"] else [i for i in ids if i in p["ids"]]
+        if not chosen:
+            return dict(p, hint="nothing selected: space ticks a workspace, a ticks all"), None
+        return None, None if (p["all"], frozenset(() if p["all"] else chosen)) == p["was"] else chosen
+    elif action == "close":
+        return None, None
+    return p, None
+
+
+def picker_lines(p):
+    """The picker's lines: All workspaces, then each listed workspace with its id and agent count."""
+    spaces = p["spaces"]
+    lw = min(24, max((len(s["label"]) for s in spaces), default=0))
+    iw = max((len(s["id"]) for s in spaces), default=0)
+    mark = lambda on: "[x]" if on else "[ ]"
+    return [mark(p["all"]) + " All workspaces"] + [
+        f"{mark(p['all'] or s['id'] in p['ids'])} {fit(s['label'], lw)}  {s['id']:<{iw}}  {s['agents']} agent"
+        + ("" if s["agents"] == 1 else "s") for s in spaces]
+
+
+def draw_picker(scr, p, top, bottom, w):
+    """The workspace picker in place of the table, on rows top..bottom-1; the cursor line in view."""
+    scr.addnstr(top, 0, " workspaces to show", w - 1, curses.A_BOLD)
+    lines = picker_lines(p)
+    at, room = min(p["at"], len(lines) - 1), bottom - top - 1
+    first = max(0, at - room + 1)
+    for n, line in enumerate(lines[first:first + max(0, room)]):
+        scr.addnstr(top + 1 + n, 1, line, w - 2, curses.A_REVERSE if first + n == at else 0)
 
 
 def draw_detail(scr, row, top, h, w, C):
@@ -1348,19 +1556,53 @@ def save_reads(path):
 
 def refresh_forever(state, every=2.0):
     """Background thread: collect() off the UI thread, so a slow herdr never freezes keys or mouse.
-    The UI only reads state["data"]; one assignment of a tuple, so no lock is needed."""
+    This thread writes data, scope, shown, spaces, gone and drop, each one assignment; the UI reads
+    them and is the only writer of choice, so no lock is needed. The UI sets state["wake"] after it
+    changes the choice, so the rows follow at once."""
+    wake = state.setdefault("wake", threading.Event())
     while True:
+        wake.clear()
         try:
             refresh_once(state)
         except Exception as e:  # never let the thread die: the screen would freeze on old rows
             state["data"] = (state["data"][0], f" ⚠ monitor error: {type(e).__name__}: {e} ·")
-        time.sleep(every)
+        wake.wait(every)
+
+
+def note_gone(state):
+    """Refresh thread: state["drop"] = the chosen ids whose workspace was missing from this refresh and
+    the one before. Only the UI thread changes the choice (apply_drop), so the two never race on it."""
+    choice, spaces = state.get("choice"), state.get("spaces")
+    if not isinstance(choice, list) or spaces is None:
+        state["gone"] = set()
+        return
+    live = {s["id"] for s in spaces}
+    gone = {i for i in choice if i not in live}
+    state["drop"], state["gone"] = gone & state.get("gone", set()), gone
+
+
+def apply_drop(state):
+    """UI thread: take the ids note_gone confirmed out of the choice and save the rest (none left: the
+    AGENT_MONITOR_SCOPE again). herdr can give a closed workspace's id to a new workspace, which the old
+    choice would then show. True when the choice changed."""
+    drop, choice = state.get("drop"), state.get("choice")
+    if not drop or not isinstance(choice, list):
+        return False
+    state["drop"] = set()
+    kept = [i for i in choice if i not in drop] or None
+    if kept == choice:
+        return False
+    state["choice"] = kept
+    save_choice(state.get("pane"), kept, state.get("env"), {s["id"] for s in state.get("spaces") or []})
+    return True
 
 
 def refresh_once(state):
     try:
-        rows, state["scope"] = collect()
+        # spaces last: the UI opens the picker once spaces is set, on shown
+        rows, state["scope"], state["shown"], state["spaces"] = collect(choice=state.get("choice"))
         state["data"] = (rows, "")
+        note_gone(state)
         publish(rows)
     except subprocess.TimeoutExpired as e:  # keep the last rows until herdr answers again
         state["data"] = (state["data"][0], f" ⚠ herdr did not answer: {' '.join(e.cmd[1:3])} ·")
@@ -1370,12 +1612,31 @@ def refresh_once(state):
         state["data"] = (state["data"][0], f" ⚠ monitor error: {type(e).__name__}: {one_line(str(e), 120)} ·")
 
 
-def draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w):
-    title = f" agent monitor · {state['scope']} · {len(rows)} agents"
-    scr.addnstr(0, 0, title, w - 1, curses.A_BOLD)
-    full = sum(1 for r in rows if r["pct"] is not None and r["pct"] >= CTX_NOTIFY)
-    if full and len(title) < w - 1:
-        scr.addnstr(0, len(title), f" · {full} context ≥{CTX_NOTIFY}%", w - 1 - len(title), C["warn"] | curses.A_BOLD)
+def draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w, picker=None):
+    alert = ctx_alert(rows)
+    title = " " + title_text(state["scope"], len(rows), w - 2, alert)
+    at = len(title) - len(alert)  # the alert ends the title, in the warning colour
+    scr.addnstr(0, 0, title[:at], w - 1, curses.A_BOLD)
+    if alert and at < w - 1:
+        scr.addnstr(0, at, alert, w - 1 - at, C["warn"] | curses.A_BOLD)
+    if picker is not None:
+        draw_picker(scr, picker, 1, body + 2, w)
+    else:
+        draw_table(scr, C, state, rows, warn, cols, spec, picked, sel, first, list_h, body, detail, w)
+    if view == "usage" and h >= 4:
+        scr.addnstr(h - 2, 0, totals(rows), w - 1, curses.A_BOLD)
+    if picker is not None:
+        note = f" ⚠ {picker['hint']} ·" if picker["hint"] else warn
+        help_ = " [workspaces] ↑↓ move · space toggle · a all · ⏎ apply · esc close"
+    else:
+        hidden = ",".join(c[0] for c in cols if c[1] == -1)
+        note, help_ = warn, (f" [{view}] v: switch view · w workspaces · click row: details · drag │: width"
+                             f" · ⏎ jump · ←→ +/- space: column · q quit")
+        help_ += f" · hidden: {hidden}" if hidden else ""
+    scr.addnstr(h - 1, 0, note + help_, w - 1, C["warn"] if note else C["dim"])
+
+
+def draw_table(scr, C, state, rows, warn, cols, spec, picked, sel, first, list_h, body, detail, w):
     for i, x, cw in spec:  # header: picked column underlined, edges are drag handles
         if x < w - 1:
             attr = curses.A_BOLD | (curses.A_UNDERLINE if i == picked else 0)
@@ -1392,13 +1653,11 @@ def draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h
         scr.addnstr(2, 1, f"no agents in {state['scope']}", w - 2, C["dim"])
     if detail and rows and body - list_h >= 2:
         draw_detail(scr, rows[sel], list_h + 2, body + 3, w, C)
-    if view == "usage" and h >= 4:
-        scr.addnstr(h - 2, 0, totals(rows), w - 1, curses.A_BOLD)
-    hidden = ",".join(c[0] for c in cols if c[1] == -1)
-    help_ = (f" [{view}] v: switch view · click row: details · drag │: width"
-             f" · ⏎ jump · ←→ +/- space: column · q quit")
-    scr.addnstr(h - 1, 0, warn + help_ + (f" · hidden: {hidden}" if hidden else ""), w - 1,
-                C["warn"] if warn else C["dim"])
+
+
+PICKER_KEYS = {curses.KEY_UP: "up", ord("k"): "up", curses.KEY_DOWN: "down", ord("j"): "down",
+               ord(" "): "toggle", ord("a"): "all", 10: "apply", 13: "apply", curses.KEY_ENTER: "apply",
+               ord("w"): "close", ord("q"): "close"}
 
 
 def tui(scr):
@@ -1412,13 +1671,23 @@ def tui(scr):
     sel = picked = 0
     detail = False
     drag = None  # column index being resized with the mouse
-    state = {"data": ([], " loading… ·"), "scope": "…"}
+    picker = None  # the w picker's state while it is open
+    pane, env = os.environ.get("HERDR_PANE_ID"), parse_scope(os.environ.get("AGENT_MONITOR_SCOPE"))
+    # spaces: the server's workspaces, None until a refresh lists them (and sets shown)
+    state = {"data": ([], " loading… ·"), "scope": "…", "shown": None, "spaces": None,
+             "choice": load_choice(pane, env), "pane": pane, "env": env, "wake": threading.Event()}
     threading.Thread(target=refresh_forever, args=(state,), daemon=True).start()
+    rows = []
     while True:
         cols = colsets[view]
+        # a refresh can reorder or replace the rows (an agent turned blocked, a new workspace choice):
+        # the selection stays on its agent while it is listed
+        sel_pane = rows[min(sel, len(rows) - 1)]["pane"] if rows else None
+        if apply_drop(state):
+            state["wake"].set()
         rows, warn = state["data"]
         h, w = scr.getmaxyx()
-        sel = min(sel, max(0, len(rows) - 1))
+        sel = next((n for n, r in enumerate(rows) if r["pane"] == sel_pane), min(sel, max(0, len(rows) - 1)))
         picked = min(picked, len(cols) - 1)
         # rows: 0 title (scope), 1 column header, 2.. agents, then [usage totals], status line
         body = max(0, h - 4 if view == "usage" else h - 3)
@@ -1430,7 +1699,8 @@ def tui(scr):
             if h < 3 or w < 12:  # too small for a table: say so, keep handling keys
                 scr.addnstr(0, 0, "agent monitor: pane too small", max(1, w - 1))
             else:
-                draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w)
+                draw(scr, C, state, rows, warn, cols, spec, view, picked, sel, first, list_h, body, detail, h, w,
+                     picker)
         except curses.error:
             pass  # a resize landed mid-draw; the next frame redraws at the new size
         scr.refresh()
@@ -1444,7 +1714,9 @@ def tui(scr):
                     break
             scr.timeout(250)  # redraw soon after the background refresh lands
             mouse = parse_mouse(seq) if seq else None
-            if not seq:
+            if picker is not None:  # Esc closes the picker; it takes no mouse input
+                picker = picker if seq else None
+            elif not seq:
                 detail = False
             elif mouse:
                 b, mx, my, down = mouse
@@ -1469,9 +1741,22 @@ def tui(scr):
                     detail = not (detail and clicked == sel)  # click again to close
                     sel = clicked
             continue
+        if picker is not None:
+            if k in PICKER_KEYS:
+                picker, choice = picker_step(picker, PICKER_KEYS[k])
+                if choice:
+                    state["choice"] = choice
+                    save_choice(pane, choice, env, {s["id"] for s in state["spaces"]})
+                    state["wake"].set()
+            continue
         if k == ord("q"):
             return
-        if k == ord("v"):
+        if k == ord("w") and state["spaces"] is not None:
+            picker = picker_open(state["shown"], state["spaces"], state["choice"])
+            if drag is not None:  # the picker takes no mouse input: end the resize as its release would
+                drag = None
+                save_cols(colsets)
+        elif k == ord("v"):
             view = "usage" if view == "activity" else "activity"
         elif k in (curses.KEY_DOWN, ord("j")):
             sel += 1
@@ -1536,15 +1821,14 @@ def once(argv):
     width = os.get_terminal_size().columns if sys.stdout.isatty() else 200
     view = "usage" if "--usage" in argv else "activity"
     try:
-        rows, scope = collect(wait=True)
+        rows, scope = collect(wait=True)[:2]
     except subprocess.TimeoutExpired as e:
         print(f"⚠ herdr did not answer: {' '.join(e.cmd[1:3])}", file=sys.stderr)
         return 1
     except HerdrError as e:
         print(f"⚠ herdr: {e}", file=sys.stderr)
         return 1
-    full = sum(1 for r in rows if r["pct"] is not None and r["pct"] >= CTX_NOTIFY)
-    print((f"agent monitor · {scope} · {len(rows)} agents" + (f" · {full} context ≥{CTX_NOTIFY}%" if full else ""))[:width])
+    print(title_text(scope, len(rows), width, ctx_alert(rows))[:width])
     print("\n".join(frame(rows, VIEWS[view], width)))
     if view == "usage":
         print(totals(rows))

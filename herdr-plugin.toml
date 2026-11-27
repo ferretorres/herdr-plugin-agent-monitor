@@ -1,6 +1,6 @@
 id = "ferretorres.agent-monitor"
 name = "agent-monitor"
-version = "0.4.0"
+version = "0.5.0"
 description = "What the agents on this herdr server are doing and using: goal, last prompt, current action, context, tokens, cost"
 min_herdr_version = "0.9.5"
 platforms = ["linux", "macos"]
