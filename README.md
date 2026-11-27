@@ -128,27 +128,40 @@ herdr plugin pane open --plugin ferretorres.agent-monitor --entrypoint monitor -
   --env AGENT_MONITOR_SCOPE=workspace
 ```
 
-## Crews: leads and workers
+## Crews: leads, workers and mates
 
 When panes carry crew tokens (`herdr pane report-metadata <pane> --source crew --token ...`), the monitor
-shows each lead with its workers under it:
+shows each lead with its workers under it, and each second mate under its first mate:
 
 | Token | On | Value |
 | --- | --- | --- |
 | `crew_role` | every crew pane | `lead` or `worker` |
 | `crew_lead` | worker panes | the lead's pane id, e.g. `w1:p2` |
 | `crew_name` | every crew pane | the crew's name |
+| `crew_mate_of` | a second mate's lead pane | its first mate's lead pane id, e.g. `w1:p2` |
 
 ```
 ST WORKSPACE  PANE      AGENT        GOAL
 ●  api        w1:p2     claude       Lead: ship herdr-crew 0.2
 ○  api        └ w1:p3   alpha-tests  write monitor tests
 ●  api          └ w1:p4 opencode     sleep 600
+○  web        └ w2:p1   claude       Second mate: web pages
+●  web          └ w2:p2 web-tests    write page tests
 ```
 
 A worker can lead its own workers. Rows are grouped by workspace, so a worker whose lead is in another
-workspace, not shown or gone is listed at the top level of its own workspace. The PANE column widens to fit.
-The details panel (`d`) has a CREW line.
+workspace, not shown or gone is listed at the top level of its own workspace, except in a first mate's tree
+(below).
+
+A second mate is the lead of its own crew, usually in another workspace, linked to a first mate (an ordinary
+lead). When both are shown, the first mate's whole tree (its workers, its second mates and their workers) is
+listed in the first mate's workspace, and a blocked agent anywhere in it moves that workspace up; WORKSPACE
+still names each row's own workspace. A second mate whose first mate is not shown heads its own workspace's
+rows. A lead whose `crew_mate_of` names itself, a pane that is not a lead, or a loop of links stays at the top
+level.
+
+The PANE column widens to fit. The details panel (`d`) has a CREW line, which names the link:
+`web · lead · second mate of w1:p2`, or `alpha · lead · first mate of 1 second mate`.
 
 AGENT shows the agent's name when it has one (`herdr agent rename`), else its kind. GOAL shows the title set
 with `herdr pane report-metadata <pane> --title ...`, else the terminal title.
@@ -266,8 +279,8 @@ not numbers are ignored.
 - Codex subagent tokens are not included; Claude, pi and opencode subagent tokens are.
 - Costs are priced on session totals, so Claude's per-request long-context tier, fast mode and regional
   multipliers are not modelled. OpenAI models have no built-in prices; add them in `prices.json`.
-- `crew_lead` holds a pane id, which changes when a pane moves to another workspace. The crew plugin
-  rewrites the token after a move; other tools that set it have to do the same.
+- `crew_lead` and `crew_mate_of` hold a pane id, which changes when a pane moves to another workspace. The
+  crew plugin rewrites them after a move; other tools that set them have to do the same.
 
 ## Check
 

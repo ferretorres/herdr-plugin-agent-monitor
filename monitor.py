@@ -14,7 +14,8 @@ Scope: AGENT_MONITOR_SCOPE = all (default) | workspace (this pane's live workspa
 The w picker replaces it with all workspaces or a set of them, saved per monitor pane (HERDR_PANE_ID) of each
 herdr server for the AGENT_MONITOR_SCOPE it was made under.
 Rows go by workspace in sidebar order; inside one, crew tokens order them: a lead (crew_role=lead), then
-its workers (crew_lead=<lead pane>).
+its workers (crew_lead=<lead pane>). A second mate (a lead with crew_mate_of=<its first mate's lead pane>)
+is listed under its first mate with its own workers, in the first mate's workspace.
 
 Views (v to switch): activity (goal, last prompt, current action) and usage (context, tokens, cost).
 Mouse: click a row for full details (click again to close), drag a header │ to resize,
@@ -901,6 +902,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
     spaces = workspaces(snap)
     tabs = {t.get("tab_id"): t for t in snap.get("tabs") or []}
     prices = load_prices()
+    firsts = first_mates(agents)
     rows = []
     for a in agents:
         path = found[a["pane_id"]]
@@ -918,6 +920,11 @@ def build_rows(snap, ws=None, wait=False, screens=True):
         goal = a.get("title") or a.get("terminal_title_stripped") or ""  # title: report-metadata --title
         tokens = a.get("tokens") or {}
         role, lead, crew = tokens.get("crew_role"), tokens.get("crew_lead"), tokens.get("crew_name")
+        first = firsts.get(a["pane_id"])
+        mate_of = _s(tokens.get("crew_mate_of")) if role == "lead" else ""
+        n = sum(f == a["pane_id"] for f in firsts.values())
+        links = (lead and f"lead {lead}", mate_of and f"second mate of {mate_of}",
+                 n and f"first mate of {n} second mate" + ("" if n == 1 else "s"))
         ws = _s(a.get("workspace_id"))
         space = spaces.get(ws) or {}
         palette = sc_palette(a.get("tokens"), (panes.get(a["pane_id"]) or {}).get("tokens"), space.get("tokens"))
@@ -925,7 +932,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
             "pane": a["pane_id"], "agent": a["agent"], "status": a["agent_status"], "ts": ts,
             # PANE takes the agent's colour (space-colors can pin one), WORKSPACE the workspace's own.
             "space": palette, "ws": ws, "ws_space": sc_palette(space.get("tokens")) or palette,
-            "parent": lead if role == "worker" else None,
+            "parent": lead if role == "worker" else first, "mate": first,
             "pct": pct, "usd": usd, "usd_src": usd_src, "usage": usage,
             "tokens": tokens, "labels": a.get("state_labels") or {},
             "session": path or (a.get("agent_session") or {}).get("value") or "",
@@ -944,8 +951,7 @@ def build_rows(snap, ws=None, wait=False, screens=True):
             "full": [("GOAL", goal), ("LAST PROMPT", prompt or ""), ("NOW", now or ""),
                      ("USAGE", usage_text(usage, window, usd, usd_src)),
                      ("WHERE", f'{a["pane_id"]} · {a.get("cwd", "")}' + (f" · {path}" if path else ""))]
-                    + ([("CREW", " · ".join(x for x in (crew, role, lead and f"lead {lead}") if x))]
-                       if role or crew else []),
+                    + ([("CREW", " · ".join(x for x in (crew, role, *links) if x))] if role or crew else []),
         })
     prune_caches()
     rows.sort(key=lambda r: (ORDER.get(r["status"], len(ORDER)), pane_key(r["pane"])))
@@ -972,22 +978,50 @@ def pane_key(pane_id):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", pane_id or "")]
 
 
+def first_mates(agents):
+    """{lead pane: the first mate it is listed under as a second mate, else None} for the leads among agents.
+    A second mate's crew_mate_of names its first mate's lead pane; one that names the lead itself, a pane
+    that is not one of these leads, or a chain of links that comes back on itself leaves the lead a root."""
+    mates = {}
+    for a in agents:
+        tokens = a.get("tokens") or {}
+        if tokens.get("crew_role") == "lead":
+            mates[a["pane_id"]] = _s(tokens.get("crew_mate_of"))
+    firsts = {}
+    for pane, at in mates.items():
+        seen = {pane}
+        while at in mates and at not in seen:
+            seen.add(at)
+            at = mates[at]
+        firsts[pane] = mates[pane] if len(seen) > 1 and at not in seen else None
+    return firsts
+
+
 def space_order(rows, spaces):
     """Rows by workspace, the one with the most urgent agent first so blocked agents stay at the top,
     then in snapshot (sidebar) order, then workspaces the snapshot does not list, by id; each workspace's
-    rows in tree_order, so a worker whose lead is elsewhere is a root."""
+    rows in tree_order, so a worker whose lead is elsewhere is a root. A first mate's whole tree (its
+    workers, its second mates and theirs) is listed in the first mate's workspace and counts for its
+    urgency, though each row still names its own workspace."""
     pos = {ws: n for n, ws in enumerate(spaces)}
+    top, home = None, {}
+    for r in tree_order(rows):  # the trees across workspaces; the pass per workspace below redraws PANE
+        top = r if r["depth"] == 0 else top
+        home[r["pane"]] = top
+    mated = {home[r["pane"]]["pane"] for r in rows if r.get("mate")}
     groups = {}
     for r in rows:
-        groups.setdefault(r["ws"], []).append(r)
+        top = home[r["pane"]]
+        groups.setdefault(top["ws"] if top["pane"] in mated else r["ws"], []).append(r)
     urgent = {ws: min(ORDER.get(r["status"], len(ORDER)) for r in rs) for ws, rs in groups.items()}
     return [r for ws in sorted(groups, key=lambda ws: (urgent[ws], pos.get(ws, len(pos)), pane_key(ws)))
             for r in tree_order(groups[ws])]
 
 
 def tree_order(rows):
-    """Each lead followed by its workers (crew_lead token = the lead's pane id), depth-first,
-    indented with └ in PANE. A worker whose lead is not shown is a root; cycles are cut."""
+    """Each lead followed by its workers (crew_lead token = the lead's pane id) and its second mates
+    (first_mates), depth-first, indented with └ in PANE. A worker whose lead is not shown is a root;
+    cycles are cut."""
     shown = {r["pane"] for r in rows}
     kids = {}
     for r in rows:
