@@ -443,13 +443,15 @@ assert crew_line(rows, "w3:p2") == "gamma · worker · lead w3:p1"
 assert crew_line(by_pane(["w1", "w2"]), "w1:p2") == "alpha · lead · first mate of 1 second mate"
 assert crew_line(by_pane(["w1"]), "w1:p2") == "alpha · lead"
 # Without its first mate, a second mate is a root of its own workspace, as before; its CREW line still names it.
-assert mated(["w2"]) == [("w2:p3", 0), ("w2:p1", 0), ("w2:p2", 1)], mated(["w2"])
-assert mated(["w3", "w2"]) == [("w2:p3", 0), ("w2:p1", 0), ("w2:p2", 1), ("w3:p1", 0), ("w3:p2", 1), ("w3:p3", 0)]
+# Its blocked worker puts its branch before the working agent w2:p3.
+assert mated(["w2"]) == [("w2:p1", 0), ("w2:p2", 1), ("w2:p3", 0)], mated(["w2"])
+assert mated(["w3", "w2"]) == [("w2:p1", 0), ("w2:p2", 1), ("w2:p3", 0), ("w3:p1", 0), ("w3:p2", 1), ("w3:p3", 0)]
 assert crew_line(by_pane(["w2"]), "w2:p1") == "beta · lead · second mate of w1:p2"
 # The crew kit's shape: first mate w1:p1 with four workers, second mates w2:p1..w6:p1 with three each; w2:p1 is
 # working and w6's worker w6:p4 is blocked. In a first mate's tree the branch with the most urgent agent comes
 # first among its siblings, so w6:p4 is the third row, not the 23rd, and a working second mate's crew does not
-# push it down. w7's crew has no mates and keeps its order: w7:p4, blocked, is w7:p3's worker, after w7:p2.
+# push it down. The same rule holds in w7's crew, which has no mates: w7:p3's branch, with its blocked worker
+# w7:p4, comes before w7:p2.
 KIT = {"agents": [agent("w1:p1", tokens=member("alpha", "lead"))]
        + [agent(f"w1:p{i}", tokens=member("alpha", lead="w1:p1")) for i in range(2, 6)]
        + [agent(f"w{w}:p{i}", status={(2, 1): "working", (6, 4): "blocked"}.get((w, i), "idle"),
@@ -462,7 +464,7 @@ kit = mated(snap=KIT)
 assert kit[:5] == [("w1:p1", 0), ("w6:p1", 1), ("w6:p4", 2), ("w6:p2", 2), ("w6:p3", 2)], kit
 assert [p for p, d in kit[:25] if d == 1] == ["w6:p1", "w2:p1", "w1:p2", "w1:p3", "w1:p4", "w1:p5", "w3:p1",
                                                "w4:p1", "w5:p1"], kit
-assert kit[25:] == [("w7:p1", 0), ("w7:p2", 1), ("w7:p3", 1), ("w7:p4", 2)], kit
+assert kit[25:] == [("w7:p1", 0), ("w7:p3", 1), ("w7:p4", 2), ("w7:p2", 1)], kit
 # A crew_mate_of naming its own lead, a pane that is not a lead (an agent outside a crew, a worker) or a lead
 # whose links come back around leaves that lead a root: every row is listed once and nothing loops.
 ODD_MATES = {"agents": [agent("w5:p1", tokens=member("one", "lead", mate_of="w5:p1")),
@@ -479,8 +481,8 @@ assert mated(snap=ODD_MATES) == [("w5:p1", 0), ("w5:p2", 0), ("w5:p3", 0), ("w5:
 odd_rows = {r["pane"]: r for r in monitor.build_rows(ODD_MATES, screens=False)}
 odd_crew = [crew_line(odd_rows, p) for p in ("w5:p1", "w5:p2", "w5:p4", "w6:p1", "w7:p1", "w8:p1")]
 assert odd_crew == [f"{c} · lead" for c in ("one", "two", "three", "five", "six", "seven")], odd_crew
-# In the workspace that lists a first mate's tree, every branch goes by its most urgent agent, top-level ones
-# included. Idle first mate w1:p5, whose second mate's worker w2:p2 is blocked, comes before the working agent
+# Every branch goes by its most urgent agent, top-level ones included, also where a first mate's tree is
+# listed. Idle first mate w1:p5, whose second mate's worker w2:p2 is blocked, comes before the working agent
 # w1:p1 and the working crew ops there; when ops' worker w1:p4 is the blocked one, ops comes first instead.
 SHARED = {"agents": [agent("w1:p1", status="working"), agent("w1:p5", tokens=member("alpha", "lead")),
                      agent("w1:p2", status="working", tokens=member("ops", "lead")),

@@ -14,7 +14,8 @@ ST WORKSPACE  PANE    AGENT        AGE   GOAL                               LAST
 ```
 
 - **Activity view**: workspace, status, goal, last prompt and the action the agent is taking right now. Rows
-  are grouped by workspace in sidebar order, and blocked agents sort first within each one.
+  are grouped by workspace, the one with the most urgent agent first, then in sidebar order. Within each, the
+  branch (an agent and the workers under it) with the most urgent agent comes first, so blocked agents are on top.
 - **Usage view** (`v`): model, context size and % of the window, input / cache / output tokens, estimated cost.
 
 ```
@@ -156,8 +157,8 @@ workspace, not shown or gone is listed at the top level of its own workspace, ex
 A second mate is the lead of its own crew, usually in another workspace, linked to a first mate (an ordinary
 lead). When both are shown, the first mate's whole tree (its workers, its second mates and their workers) is
 listed in the first mate's workspace; WORKSPACE still names each row's own workspace. A blocked agent anywhere
-in that tree moves the workspace up, and in that workspace every branch, top-level ones included, goes by the
-most urgent agent in it, so a blocked agent is listed near the top, not after the other crews. A second mate whose
+in that tree moves the workspace up and, as in every workspace, puts its branch first, so it is listed near the
+top, not after the other crews. A second mate whose
 first mate is not shown is listed at the top level of its own workspace, with its workers under it. A lead
 whose `crew_mate_of` names itself, a pane that is not a lead, or a loop of links stays at the top level. Its
 CREW line names the link only when the row is nested under that first mate, or when the linked pane is not in
